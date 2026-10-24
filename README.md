@@ -145,7 +145,7 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on one Linux serve
 | `--notify`: one message per ended job; none for a stopped job | passed | passed |
 | Survives a full stop/update of the bb service | not yet observed | not tested |
 
-Unit tests (`npm test`) run on Linux and macOS in [GitHub Actions](https://github.com/tosergeivc/bb-plugin-jobs/actions): 30 tests, including `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
+Unit tests (`npm test`, run on Linux; a GitHub Actions workflow for Linux and macOS is prepared but not yet enabled): 30 tests, including `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
 
 ## Limitations
 
@@ -177,11 +177,10 @@ bb plugin install .
 | `skills/background-jobs/SKILL.md` | Instructions bb gives to agents |
 | `PLUGIN_OVERVIEW.md` | Long description for the bb marketplace |
 | `test/` | Tests for both modes |
-| `.github/workflows/ci.yml` | Typecheck and tests on Linux and macOS |
 
 ## Changelog
 
-- **0.3.0** — `--notify` / `--notify-thread`: a message to the thread when a job ends; jobs get `BB_THREAD_ID`, `BB_PROJECT_ID`, `BB_ENVIRONMENT_ID`, `BB_THREAD_STORAGE`; `bb jobs start` warns when systemd user lingering is off; native Windows machines are refused with a clear error; `[jobs]` lines always start on their own line; CI on Linux and macOS; `PLUGIN_OVERVIEW.md`. The short description no longer claims that jobs survive a bb restart, which is still unverified.
+- **0.3.0** — `--notify` / `--notify-thread`: a message to the thread when a job ends; jobs get `BB_THREAD_ID`, `BB_PROJECT_ID`, `BB_ENVIRONMENT_ID`, `BB_THREAD_STORAGE`; `bb jobs start` warns when systemd user lingering is off; native Windows machines are refused with a clear error; `[jobs]` lines always start on their own line; tests run on macOS too (no `setsid` binary needed); `PLUGIN_OVERVIEW.md`. The short description no longer claims that jobs survive a bb restart, which is still unverified.
 - **0.2.0** — `--ready-url` / `--ready-log` on `start` and `bb jobs ready`; log cap with rotation (`--log-max`, default 50 MiB); `bb jobs prune`; detached jobs identified by their launch lines and process group instead of a stored PID, so a recycled PID is never reported or stopped; per-job runner copy (a shared runner rewritten by a later `start` could corrupt running jobs); the exit code is recorded even when a leftover child keeps the output open.
 - **0.1.1** — `--env` values are no longer stored on disk after the job starts (were kept in `command.sh`). Jobs started with 0.1.0 keep their old `command.sh`.
 - **0.1.0** — first release.
