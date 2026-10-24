@@ -1,0 +1,44 @@
+{
+  "name": "bb-plugin-jobs",
+  "version": "0.1.0",
+  "description": "bb plugin: run servers, deploys and long commands as durable background jobs that survive the end of an agent turn and bb restarts.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tosergeivc/bb-plugin-jobs.git"
+  },
+  "homepage": "https://github.com/tosergeivc/bb-plugin-jobs#readme",
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "background-jobs",
+    "deploy",
+    "systemd"
+  ],
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.73"
+  },
+  "bb": {
+    "name": "Jobs",
+    "description": "Run long bash commands, servers and deploys as durable background jobs that survive the end of an agent turn and bb restarts.",
+    "branding": {
+      "icon": "Terminal"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "sh test/run.sh"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.73",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

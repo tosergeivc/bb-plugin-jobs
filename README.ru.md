@@ -1,0 +1,70 @@
+# bb-plugin-jobs
+
+English version: [README.md](README.md).
+
+Плагин bb: команда `bb jobs` запускает долгие команды (серверы, деплои, сборки) как фоновые задачи, которые не умирают вместе с ходом агента и с перезапуском bb.
+
+## Содержание
+
+- [Зачем](#зачем)
+- [Как работает](#как-работает)
+- [Команды](#команды)
+- [Файлы](#файлы)
+- [Проверка](#проверка)
+- [Ограничения](#ограничения)
+
+## Зачем
+
+Процессы, запущенные агентом через Bash, живут в дереве процессов bb. Провайдер агента завершает дерево своих процессов в конце хода (проверено: `nohup … &` и `setsid` не пережили конец хода). На Linux bb часто работает как `bb-app.service` с `KillMode=control-group`, и остановка или обновление сервиса убивает все процессы его cgroup.
+
+## Как работает
+
+- `server.ts` регистрирует CLI `bb jobs`. Команда выполняется на сервере bb и пересылает вызов host-entry на машину треда (thread → environment → hostId) или на `--machine`.
+- `host.ts` работает в демоне bb на этой машине и вызывает `JobManager` из `jobs-core.ts`.
+- Linux с user systemd: задача — transient unit `bbjob-<id>` (`systemd-run --user --collect`), своя cgroup вне `bb-app.service`. Остановка — `systemctl --user stop`, убивает всё дерево.
+- Без user systemd (macOS): detached-процесс (новая сессия). Остановка — SIGTERM группе и всем потомкам, через 10 с SIGKILL.
+- Скрипт-обёртка `runner.sh` пишет вывод в `output.log` и код выхода в файл `exit`; задача не зависит от воркера bb.
+
+## Команды
+
+| Команда | Что делает |
+|---------|------------|
+| `bb jobs start --name <метка> -- <команда>` | Запуск в текущем каталоге; `--cwd`, `--env K=V`, `--timeout 30m` |
+| `bb jobs list [--running]` | Задачи машины, новые первыми |
+| `bb jobs status <id>` | Состояние, код выхода, путь к логу |
+| `bb jobs logs <id> [--bytes N]` | Конец лога |
+| `bb jobs wait <id> [--timeout 5m]` | Ждать завершения (до 10 мин за вызов) |
+| `bb jobs stop <id>` | Остановить всё дерево процессов |
+
+Состояния: `running`, `exited`, `stopped`, `lost` (исчезла без кода выхода).
+
+## Файлы
+
+| Файл | Назначение |
+|------|------------|
+| `contract.ts` | RPC-контракт server ↔ host (zod) |
+| `jobs-core.ts` | Запуск, статус, логи, остановка; чистый Node |
+| `host.ts` | host-entry bb |
+| `server.ts` | CLI `bb jobs` |
+| `skills/background-jobs/SKILL.md` | Инструкция для агентов |
+| `test/jobs-core.test.ts`, `test/run.sh` | Тесты обоих режимов |
+
+Данные задач: `<dataDir плагина на машине>/jobs/<id>/` (права 0700).
+
+## Проверка
+
+```bash
+npm run typecheck && npm test && bb plugin build
+```
+
+## Ограничения
+
+- `--timeout` требует perl (есть в macOS и Ubuntu); без perl задача с `--timeout` завершается с кодом 125.
+- Режим `detached` на Linux переживает конец хода, но не полную остановку `bb-app.service`.
+- Задача наследует только PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_ALL, TZ, SSH_AUTH_SOCK; остальное — через `--env`.
+- Каталоги завершённых задач не удаляются автоматически.
+
+---
+
+*Created: 23 October 2026, 15:50*
+*Updated: 24 October 2026, 14:00*
