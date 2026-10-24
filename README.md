@@ -142,7 +142,7 @@ Both start the command from the bb daemon (`spawn` with `detached: true`). On Li
 
 ## What was tested
 
-Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on one Linux server and one macOS machine:
+Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on two Linux machines (both with user systemd) and one macOS machine; 0.4.1 ran the same scenario (ready check on coloured output, `logs --since`, stop, `--timeout`, exit code and `BB_THREAD_ID`) on all three:
 
 | Check | Linux (Ubuntu, user systemd) | macOS (arm64, detached) |
 |-------|------------------------------|-------------------------|
@@ -153,7 +153,7 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on one Linux serve
 | `--ready-url` / `--ready-log`, log cap with rotation | passed | passed |
 | `--notify`: one message per ended job; none for a stopped job | passed | passed |
 | Notices batched per thread, withdrawn once the agent read the result, merged into a waiting notice (0.4.0) | passed | not tested |
-| `logs` without escape codes, `--since` cursor (0.4.0) | passed | not tested in 0.4.0 |
+| `logs` without escape codes, `--since` cursor (0.4.0) | passed | passed |
 | Survives a full stop/update of the bb service | not yet observed | not tested |
 
 Real-agent check (0.4.0, 24 October 2026): a Codex thread on the Linux server, given an ordinary task ("start a server that outlives your turn, run a 40-second deploy") without any mention of `bb jobs`, found the `background-jobs` skill, started the server with `--ready-url` and the deploy with `--notify`, and ended its turn. The server kept answering after the turn; the deploy's notice woke the idle thread, which reported exit 0 and its output. The Codex sandbox did not block the `bb` CLI. Another thread's `bb jobs stop` on that server was refused without `--force`.
