@@ -57,6 +57,8 @@ export interface StartInput {
   /** Rotate output.log to output.log.1 past this size; 0 = unlimited. */
   logMaxBytes?: number;
   threadId: string | null;
+  /** BB_* context variables (thread id, thread storage, ...). */
+  bbEnv?: Record<string, string>;
 }
 
 interface JobMeta {
@@ -137,13 +139,16 @@ my $log = "$dir/output.log";
 my $fh;
 sub reopen { open($fh, '>>', $log) or die "cannot open $log: $!"; my $o = select($fh); $| = 1; select($o); }
 sub stamp { POSIX::strftime('%Y-%m-%dT%H:%M:%SZ', gmtime) }
-sub note { print $fh "[jobs] $_[0]\n"; }
+my $atlinestart = 1;
+sub note { print $fh "\n" unless $atlinestart; print $fh "[jobs] $_[0]\n"; $atlinestart = 1; }
 sub put {
   print $fh $_[0];
+  $atlinestart = substr($_[0], -1) eq "\n";
   if ($max > 0 && tell($fh) >= $max) {
     close $fh;
     rename $log, "$log.1";
     reopen();
+    $atlinestart = 1;
     note("log reached $max bytes, previous part moved to output.log.1 at " . stamp());
   }
 }
@@ -266,7 +271,28 @@ export class JobManager {
     return this.systemd;
   }
 
+  /** start() plus warnings about the machine that the caller should see. */
+  async startWithChecks(input: StartInput): Promise<Job & { warnings: string[] }> {
+    const job = await this.start(input);
+    const warnings: string[] = [];
+    if (job.mode === "systemd") {
+      const linger = await lingerEnabled();
+      if (linger === false) {
+        const user = process.env.USER ?? "$USER";
+        warnings.push(
+          `loginctl reports Linger=no for ${user}: systemd stops this user's jobs when the last login session ends. Run once on this machine: sudo loginctl enable-linger ${user}`,
+        );
+      }
+    }
+    return { ...job, warnings };
+  }
+
   async start(input: StartInput): Promise<Job> {
+    if (process.platform === "win32") {
+      throw new Error(
+        "bb jobs needs a POSIX machine (Linux or macOS; WSL works). Native Windows is not supported.",
+      );
+    }
     await mkdir(this.jobsDir(), { recursive: true, mode: 0o700 });
     const cwdStat = await stat(input.cwd).catch(() => null);
     if (!cwdStat?.isDirectory()) {
@@ -303,6 +329,9 @@ export class JobManager {
     for (const key of INHERITED_ENV) {
       const value = base[key];
       if (value) inherited[key] = value;
+    }
+    for (const [key, value] of Object.entries(input.bbEnv ?? {})) {
+      if (/^BB_[A-Z_]+$/.test(key)) inherited[key] = value;
     }
 
     let mode: JobMeta["mode"];
@@ -418,9 +447,11 @@ export class JobManager {
     const dir = this.dir(id);
     if (!(await this.isAlive(meta))) return this.describe(meta);
     await writeFile(path.join(dir, "stop-requested"), new Date().toISOString());
+    const logFile = path.join(dir, "output.log");
+    const newline = (await endsWithNewline(logFile)) ? "" : "\n";
     await appendFile(
-      path.join(dir, "output.log"),
-      `[jobs] stop requested at ${new Date().toISOString()}\n`,
+      logFile,
+      `${newline}[jobs] stop requested at ${new Date().toISOString()}\n`,
     );
     if (meta.mode === "systemd" && meta.unit) {
       // Stops every process in the unit's cgroup: SIGTERM, then SIGKILL
@@ -706,6 +737,31 @@ async function ownedProcesses(
     addDescendants();
   }
   return owned;
+}
+
+/** true/false from loginctl; null when it cannot tell (no logind, error). */
+async function lingerEnabled(): Promise<boolean | null> {
+  const user = typeof process.getuid === "function" ? String(process.getuid()) : null;
+  if (!user) return null;
+  const out = await run("loginctl", ["show-user", user, "-p", "Linger", "--value"], {
+    timeout: 5000,
+  }).catch(() => null);
+  const value = out?.stdout.trim();
+  return value === "yes" ? true : value === "no" ? false : null;
+}
+
+async function endsWithNewline(file: string): Promise<boolean> {
+  const handle = await open(file, "r").catch(() => null);
+  if (!handle) return true;
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) return true;
+    const buf = Buffer.alloc(1);
+    await handle.read(buf, 0, 1, size - 1);
+    return buf[0] === 0x0a;
+  } finally {
+    await handle.close();
+  }
 }
 
 function legacyGroupAlive(pgid: number): boolean {

@@ -15,9 +15,121 @@ import { shellQuote } from "./jobs-core.js";
 const LOG_DEFAULT_BYTES = 16 * 1024;
 const LOG_MAX_BYTES = 512 * 1024;
 const READY_MAX_MS = 10 * 60 * 1000;
+const NOTIFY_KEY = "notify";
+const NOTIFY_POLL_MS = 5000;
+const NOTIFY_TAIL_BYTES = 2048;
+
+/** A finished job's thread gets one message; entries live in plugin kv. */
+type NotifyEntry = { hostId: string; threadId: string; addedAt: string };
 
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
+
+  /**
+   * BB_* variables for a job started from a thread, when the job runs on the
+   * thread's own machine (paths like the thread storage only exist there).
+   */
+  async function threadEnv(
+    threadId: string | undefined,
+    hostId: string,
+  ): Promise<Record<string, string>> {
+    if (!threadId) return {};
+    const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    if (!thread) return {};
+    const env: Record<string, string> = { BB_THREAD_ID: threadId };
+    if (thread.projectId) env.BB_PROJECT_ID = thread.projectId;
+    if (thread.environmentId) {
+      const environment = await bb.sdk.environments
+        .get({ environmentId: thread.environmentId })
+        .catch(() => null);
+      if (environment?.hostId === hostId) env.BB_ENVIRONMENT_ID = environment.id;
+    }
+    const storage = await bb.sdk.threads.storageLocation({ threadId }).catch(() => null);
+    if (storage?.hostId === hostId) env.BB_THREAD_STORAGE = storage.storageRootPath;
+    return env;
+  }
+
+  async function readNotify(): Promise<Record<string, NotifyEntry>> {
+    return (await bb.storage.kv.get<Record<string, NotifyEntry>>(NOTIFY_KEY)) ?? {};
+  }
+  // kv has no compare-and-swap; serialise our own read-modify-write cycles.
+  let notifyLock: Promise<unknown> = Promise.resolve();
+  function updateNotify(
+    change: (entries: Record<string, NotifyEntry>) => void,
+  ): Promise<void> {
+    const next = notifyLock.then(async () => {
+      const entries = await readNotify();
+      change(entries);
+      await bb.storage.kv.set(NOTIFY_KEY, entries);
+    });
+    notifyLock = next.catch(() => undefined);
+    return next;
+  }
+
+  /** Tell the owning thread that a job ended. Returns true when done with it. */
+  async function deliverNotice(id: string, entry: NotifyEntry): Promise<boolean> {
+    let job: Job;
+    try {
+      job = await host.call("get", { id }, { hostId: entry.hostId, timeoutMs: 15_000 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // The job is gone (pruned, wrong machine): nothing left to report.
+      if (/no job with id/.test(message)) return true;
+      return false; // machine offline or worker busy: try again later
+    }
+    if (job.state === "running") return false;
+    // Stopped through `bb jobs stop`: whoever stopped it already knows.
+    if (job.state === "stopped") return true;
+    const thread = await bb.sdk.threads.get({ threadId: entry.threadId }).catch(() => null);
+    if (!thread) return true; // the thread was deleted
+    const { text } = await host
+      .call("logs", { id, maxBytes: NOTIFY_TAIL_BYTES }, { hostId: entry.hostId, timeoutMs: 15_000 })
+      .catch(() => ({ text: "" }));
+    const result = job.state === "exited" ? `exited with code ${job.exitCode}` : job.state;
+    const lines = [
+      `[bb jobs] Job ${job.id} ${result}.`,
+      `Command: ${job.command.length > 200 ? `${job.command.slice(0, 200)}…` : job.command}`,
+      `Started ${job.createdAt}${job.finishedAt ? `, ended ${job.finishedAt}` : ""}, cwd ${job.cwd}.`,
+      `Full log: bb jobs logs ${job.id}${entry.hostId ? ` --machine ${entry.hostId}` : ""}`,
+      "",
+      "Last output:",
+      "```",
+      text.trimEnd(),
+      "```",
+    ];
+    await bb.sdk.threads.send({
+      threadId: entry.threadId,
+      mode: "queue-if-active",
+      originPluginId: bb.pluginId,
+      input: [{ type: "text", text: lines.join("\n"), mentions: [] }],
+    });
+    return true;
+  }
+
+  bb.background.service("notify", {
+    async start(signal) {
+      while (!signal.aborted) {
+        const entries = await readNotify().catch(() => ({}));
+        for (const [id, entry] of Object.entries(entries)) {
+          if (signal.aborted) break;
+          let done = false;
+          try {
+            done = await deliverNotice(id, entry);
+          } catch (error) {
+            bb.log.warn(`notice for ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          if (done) await updateNotify((all) => void delete all[id]);
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, NOTIFY_POLL_MS);
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            resolve();
+          }, { once: true });
+        });
+      }
+    },
+  });
 
   async function resolveHost(
     machine: string | undefined,
@@ -192,11 +304,36 @@ export default async function plugin(bb: BbPluginApi) {
                 "Rotate output.log to output.log.1 past this many MiB, so at most twice this is kept; 0 = no limit",
             },
             ...readyOptions,
+            notify: {
+              type: "boolean",
+              description:
+                "When the job ends, post its result and last output to the calling thread (checked every 5 s)",
+            },
+            "notify-thread": {
+              type: "string",
+              description: "Thread to notify instead of the calling one; implies --notify",
+            },
             machine: machineOption,
             json: jsonOption,
           },
           async run(input, ctx) {
             const ready = readyCheck(input.options);
+            const notifyThread =
+              input.options["notify-thread"] ??
+              (input.options.notify ? ctx.threadId : undefined);
+            if (input.options.notify && !notifyThread) {
+              throw new PluginCliError("--notify needs a thread to notify", {
+                code: "missing_thread",
+                hint: "Run from a bb thread, or pass --notify-thread <thread-id>.",
+              });
+            }
+            if (notifyThread) {
+              await bb.sdk.threads.get({ threadId: notifyThread }).catch(() => {
+                throw new PluginCliError(`no thread ${notifyThread}`, {
+                  code: "thread_not_found",
+                });
+              });
+            }
             const command =
               input.passthrough.length === 1
                 ? input.passthrough[0]!
@@ -242,10 +379,20 @@ export default async function plugin(bb: BbPluginApi) {
                     : Math.ceil(input.options.timeout / 1000),
                 logMaxBytes: input.options["log-max"] * 1024 * 1024,
                 threadId: ctx.threadId ?? null,
+                bbEnv: await threadEnv(ctx.threadId, hostId),
               },
               hostId,
               ctx.signal,
             );
+            if (notifyThread) {
+              await updateNotify((all) => {
+                all[job.id] = { hostId, threadId: notifyThread, addedAt: new Date().toISOString() };
+              });
+            }
+            const warnings = job.warnings.map((w) => `Warning: ${w}\n`).join("");
+            const notifyLine = notifyThread
+              ? `Notify: thread ${notifyThread} gets a message when the job ends\n`
+              : "";
             if (ready) {
               const result = await waitReady(
                 job.id,
@@ -256,9 +403,12 @@ export default async function plugin(bb: BbPluginApi) {
               );
               if (input.options.json) {
                 const now = await call("get", { id: job.id }, hostId, ctx.signal);
-                return { exitCode: result.exitCode, stdout: JSON.stringify(now, null, 2) };
+                return {
+                  exitCode: result.exitCode,
+                  stdout: JSON.stringify({ ...now, warnings: job.warnings }, null, 2),
+                };
               }
-              return result;
+              return { ...result, stdout: warnings + notifyLine + result.stdout };
             }
             // Give fast failures (typo, missing file) a moment to surface.
             await new Promise((r) => setTimeout(r, 1500));
@@ -269,12 +419,17 @@ export default async function plugin(bb: BbPluginApi) {
               ctx.signal,
             );
             if (input.options.json) {
-              return { exitCode: 0, stdout: JSON.stringify(now, null, 2) };
+              return {
+                exitCode: 0,
+                stdout: JSON.stringify({ ...now, warnings: job.warnings }, null, 2),
+              };
             }
             return {
               exitCode: now.state === "exited" && now.exitCode !== 0 ? 1 : 0,
               stdout:
+                warnings +
                 `${describe(now)}\n` +
+                notifyLine +
                 `Logs:  bb jobs logs ${now.id}\n` +
                 `Wait:  bb jobs wait ${now.id}\n` +
                 `Stop:  bb jobs stop ${now.id}\n` +

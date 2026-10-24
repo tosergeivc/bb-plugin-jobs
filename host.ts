@@ -13,7 +13,8 @@ function jobs(dataDir: string): JobManager {
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
-    start: (input, ctx) => jobs(ctx.experimental_paths.dataDir).start(input),
+    start: (input, ctx) =>
+      jobs(ctx.experimental_paths.dataDir).startWithChecks(input),
     list: async ({ limit }, ctx) => ({
       jobs: await jobs(ctx.experimental_paths.dataDir).list(limit),
     }),

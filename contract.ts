@@ -44,9 +44,11 @@ export const hostContract = defineRpcContract({
         timeoutSec: z.number().int().positive().nullable(),
         logMaxBytes: z.number().int().min(0),
         threadId: z.string().nullable(),
+        // BB_THREAD_ID, BB_THREAD_STORAGE, ... for the job's environment.
+        bbEnv: z.record(z.string().regex(/^BB_[A-Z_]+$/), z.string()),
       })
       .strict(),
-    output: jobSchema,
+    output: jobSchema.extend({ warnings: z.array(z.string()) }),
   },
   list: {
     input: z.object({ limit: z.number().int().min(1).max(500) }).strict(),

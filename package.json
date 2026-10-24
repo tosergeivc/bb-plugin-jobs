@@ -1,7 +1,7 @@
 {
   "name": "bb-plugin-jobs",
-  "version": "0.2.0",
-  "description": "bb plugin: run servers, deploys and long commands as durable background jobs that survive the end of an agent turn and bb restarts.",
+  "version": "0.3.0",
+  "description": "bb plugin: run servers, deploys and long commands as background jobs that outlive the agent's turn, with ready checks and completion notices.",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -22,7 +22,7 @@
   },
   "bb": {
     "name": "Jobs",
-    "description": "Run long bash commands, servers and deploys as durable background jobs that survive the end of an agent turn and bb restarts.",
+    "description": "Run servers, deploys and long commands as background jobs that outlive the agent's turn, with ready checks and completion notices.",
     "branding": {
       "icon": "Terminal"
     },
@@ -39,6 +39,7 @@
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.73",
     "@types/node": "^22.0.0",
+    "esbuild": "0.28.1",
     "typescript": "^5.7.0"
   }
 }

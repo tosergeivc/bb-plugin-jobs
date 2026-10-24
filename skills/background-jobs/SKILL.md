@@ -22,6 +22,7 @@ log file.
 | `bb jobs start --cwd <dir> --env K=V --timeout 30m -- <command>` | Set directory, extra env (repeat `--env`) and a hard time limit (SIGTERM, SIGKILL 15 s later; exit 124). |
 | `bb jobs start --name api --ready-url http://localhost:3000/health -- 'npm start'` | Start a server and return when it answers 2xx (`--ready-log '<regex>'` waits for a log line instead; `--ready-timeout`, default 60s, max 10m). Exit 0 ready, 1 the job ended, 124 not ready yet. |
 | `bb jobs ready <id> --url <url>` / `--log <regex>` | Re-check readiness of a running job. |
+| `bb jobs start --notify -- <command>` | Post the result and last output to this thread when the job ends (`--notify-thread <id>` for another thread). |
 | `bb jobs list [--running]` | Jobs on this machine, newest first. |
 | `bb jobs status <id>` | State, exit code, command and log path. |
 | `bb jobs logs <id> [--bytes N]` | End of the job's combined stdout/stderr (default 16 KiB). |
@@ -43,9 +44,16 @@ All commands accept `--machine <id|name>` to target another machine and
   kept on disk after the job starts. Pass a secret as `--env TOKEN="$TOKEN"`,
   never literally, and never inside the command: the command is stored and
   shown by `bb jobs status`.
-- After `start`, read the printed first output. For a deploy, follow with
-  `bb jobs wait <id> --timeout 10m` and repeat `wait` until it is no longer
-  running; report the exit code and the relevant log lines.
+- After `start`, read the printed first output. For a deploy or any job you
+  do not need to watch, add `--notify`: the thread gets a `[bb jobs]` message
+  with the result and last output when the job ends, so you can end your turn
+  or do other work instead of polling. Report the exit code and the relevant
+  log lines when that message arrives. Without `--notify`, use
+  `bb jobs wait <id> --timeout 10m` and repeat while it returns 124.
+- The job gets `BB_THREAD_ID` and, on the thread's machine,
+  `BB_THREAD_STORAGE`; write job artifacts there.
+- If `start` prints a linger warning, tell the user: the job dies when they
+  log out until they run the printed `loginctl enable-linger` command.
 - For a server, start it with `--ready-url` (or `--ready-log`) and say it is up
   only after exit 0. On exit 124 read `bb jobs logs <id>` before retrying
   `bb jobs ready`. `bb jobs stop <id>` when it is no longer needed.

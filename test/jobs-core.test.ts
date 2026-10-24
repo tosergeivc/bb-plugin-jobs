@@ -56,7 +56,7 @@ for (const forceDetached of [false, true]) {
         env: { GREETING: "it's me" },
       });
       assert.match(job.id, /^echo-test-[0-9a-f]{6}$/);
-      assert.equal(job.mode, forceDetached ? "detached" : "systemd");
+      assert.equal(job.mode, (await jobs.hasSystemd()) ? "systemd" : "detached");
       const done = await until(() => jobs.get(job.id), (j) => j.state !== "running");
       assert.equal(done.state, "exited");
       assert.equal(done.exitCode, 3);
@@ -66,7 +66,7 @@ for (const forceDetached of [false, true]) {
 
     it("stop kills the whole process tree, including a child in its own group", async () => {
       const n = forceDetached ? 4100 : 4200;
-      writeFileSync(path.join(work, "tree.sh"), `sleep ${n} & setsid sleep ${n + 1} & sleep ${n + 2}\n`);
+      writeFileSync(path.join(work, "tree.sh"), `sleep ${n} & perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' sleep ${n + 1} & sleep ${n + 2}\n`);
       const job = await jobs.start({ ...base, name: "tree", command: "bash tree.sh" });
       await until(() => jobs.get(job.id), (j) => j.state === "running");
       await sleep(500);
@@ -247,6 +247,19 @@ for (const forceDetached of [false, true]) {
       const deleted = await jobs.prune(0, { remove: true, dryRun: false });
       assert.ok(deleted.pruned.some((p) => p.id === keep.id));
       assert.equal(existsSync(path.dirname(keep.logPath)), false);
+    });
+
+    it("puts [jobs] lines on their own line and passes BB_* context", async () => {
+      const job = await jobs.startWithChecks({
+        ...base,
+        name: "ctx",
+        command: 'printf "%s|%s" "$BB_THREAD_ID" "$BB_THREAD_STORAGE"',
+        bbEnv: { BB_THREAD_ID: "thr_test", BB_THREAD_STORAGE: "/tmp/store", NOT_BB: "x" },
+      });
+      assert.ok(Array.isArray(job.warnings));
+      await until(() => jobs.get(job.id), (j) => j.state !== "running");
+      const { text } = await jobs.logs(job.id, 4096);
+      assert.match(text, /^thr_test\|\/tmp\/store\n\[jobs\] exited 0 /m, text);
     });
 
     it("lists newest first", async () => {
