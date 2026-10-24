@@ -40,7 +40,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.4.0
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.4.1
 ```
 
 bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
@@ -64,7 +64,7 @@ bb jobs prune --older-than 7d
 |---------|--------|
 | `bb jobs start [--name N] [--cwd DIR] [--env K=V]... [--timeout 30m] [--log-max 50] -- <command>` | Start a job; prints id, state and first output |
 | `bb jobs start … --ready-url URL` / `--ready-log REGEX` [`--ready-timeout 60s`] | Start, then return only when the URL answers 2xx or a log line matches; exit 0 ready, 1 job ended, 124 not ready yet (job keeps running) |
-| `bb jobs start … --notify` / `--notify-thread THREAD` | When the job ends, post its result, command, times and last 2 KiB of output to the calling (or given) thread |
+| `bb jobs start … --notify` / `--notify-thread THREAD` | When the job ends, post a short notice to the calling (or given) thread: result, duration, command, where the log is, and the last 5 lines of output for exit 0 or the last 2 KiB otherwise |
 | `bb jobs ready <id> --url URL` / `--log REGEX` [`--timeout 60s`] | The same readiness check for a job that is already running |
 | `bb jobs list [--running] [--all]` | Jobs started from the calling thread, newest first; `--all` shows every thread's jobs on the machine (outside a thread, all jobs) |
 | `bb jobs status <id>` | State, exit code, command, log path |
@@ -122,7 +122,7 @@ agent Bash: bb jobs start ──► server.ts (bb server, CLI)
 - `exec.pl` runs the command in its own process group with output on a pipe, copies the pipe into `output.log` with the size cap, enforces `--timeout` (SIGTERM to the group, SIGKILL 15 s later, exit 124) and writes the exit code to `exit` atomically as soon as the command ends. It keeps copying while a leftover child still writes, so that child does not die of SIGPIPE. The job does not depend on the bb worker after it starts.
 - In detached mode no stored PID is trusted, because PIDs get reused. A process belongs to the job when its command line is exactly one of the job's own launch lines (`runner.sh`, `exec.pl`, `command.sh` in the job directory), when it descends from one, or when it is in the command's process group, started no earlier than the job, and that group's leader is the job's own process or already gone. A recycled PID, or a process that merely mentions the job directory (`tail -f …/output.log`), is never reported or signalled. macOS hides other processes' environments, so an environment marker cannot do this. In systemd mode the unit's cgroup defines the job.
 - Job files live in the plugin's data directory on the machine, `jobs/<id>/`, mode 0700.
-- `--notify` stores the job id, machine and thread in the plugin's server storage. A background service on the bb server checks those jobs every 5 seconds and sends each thread one message for all of its jobs that ended since the last check, with `queue-if-active`: an active thread gets it after the current turn, an idle thread starts a new turn. A notice is cancelled when the agent reads the finished result itself (`wait`, `status`, `logs`, `ready`, or `start` showing a fast failure). Jobs stopped with `bb jobs stop`, jobs that no longer exist and deleted threads are dropped without a message; a message bb rejects five times is dropped with a log line.
+- `--notify` stores the job id, machine and thread in the plugin's server storage. A background service on the bb server checks those jobs every 5 seconds and sends each thread one message for all of its jobs that ended since the last check, with `queue-if-active`: an active thread gets it after the current turn, an idle thread starts a new turn. A notice is cancelled when the agent reads the finished result itself (`wait`, `status`, `logs`, `ready`, or `start` showing a fast failure). Cancelling works only while the notice waits in the thread's queue, that is while the thread is busy: a notice to an idle thread is delivered at once and starts a turn, and cannot be taken back. By default notices are agent-only (the setting `notifyVisibility`, `bb plugin config jobs set notifyVisibility visible` to show them in the chat as well); the agent reads them, the chat shows the agent's reply. Jobs stopped with `bb jobs stop`, jobs that no longer exist and deleted threads are dropped without a message; a message bb rejects five times is dropped with a log line.
 - `logs --since` cursors count bytes from the job's start across log rotations (`log-base` in the job directory records the bytes rotated out), so a cursor stays valid after a rotation; output rotated away for good is reported as skipped bytes.
 
 ## Works well with
@@ -168,6 +168,7 @@ Unit tests (`npm test`, run on Linux; a GitHub Actions workflow for Linux and ma
 - Detached mode on Linux survives the end of a turn but not a stop of a bb service that uses `KillMode=control-group`.
 - Finished job directories are not removed automatically; run `bb jobs prune`. The default moves them to `archive/`, which does not free disk space; `--delete` does.
 - `wait` blocks at most 10 minutes per call.
+- Agent-only notices were checked with Claude Code and Codex threads (24 October 2026): both agents read the job output from the notice. Other providers were not checked; if an agent does not react to notices, set `notifyVisibility` to `visible`.
 - `--notify` delivers at least once: if the bb server stops between sending the message and recording it, the thread can get the same message twice. It does not retry a message bb rejected. Notices reach the thread up to about 5 seconds after the job ends. A message to an idle thread starts a new agent turn.
 - The `--notify` list lives on the bb server; a job on a machine that stays offline is reported when the machine reconnects.
 
@@ -193,6 +194,7 @@ bb plugin install .
 
 ## Changelog
 
+- **0.4.1** — shorter notices (one result line with duration, log location, last 5 lines for exit 0, last 2 KiB otherwise, no repeated `[jobs]` lines); notices are agent-only by default (`notifyVisibility` setting); records of sent notices are cleaned every minute; README explains when a notice cannot be withdrawn.
 - **0.4.0** — `logs` removes terminal colour codes and progress-bar redraws (`--raw` keeps them) and reads by cursor (`--since`, `next:` line, `--json`); `--ready-log` now matches the cleaned text; one notice per thread for jobs that end together, cancelled when the agent already read the result; `list` shows the calling thread's jobs (`--all` for every thread); `stop` refuses another thread's running job without `--force`; skill: `bb connect expose` for remote viewers; README: works well with Lame duck, Env Catalog, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`.
 - **0.3.0** — `--notify` / `--notify-thread`: a message to the thread when a job ends; jobs get `BB_THREAD_ID`, `BB_PROJECT_ID`, `BB_ENVIRONMENT_ID`, `BB_THREAD_STORAGE`; `bb jobs start` warns when systemd user lingering is off; native Windows machines are refused with a clear error; `[jobs]` lines always start on their own line; tests run on macOS too (no `setsid` binary needed); `PLUGIN_OVERVIEW.md`. The short description no longer claims that jobs survive a bb restart, which is still unverified.
 - **0.2.0** — `--ready-url` / `--ready-log` on `start` and `bb jobs ready`; log cap with rotation (`--log-max`, default 50 MiB); `bb jobs prune`; detached jobs identified by their launch lines and process group instead of a stored PID, so a recycled PID is never reported or stopped; per-job runner copy (a shared runner rewritten by a later `start` could corrupt running jobs); the exit code is recorded even when a leftover child keeps the output open.

@@ -18,6 +18,9 @@ const READY_MAX_MS = 10 * 60 * 1000;
 const NOTIFY_KEY = "notify";
 const NOTIFY_POLL_MS = 5000;
 const NOTIFY_TAIL_BYTES = 2048;
+/** Lines of output a notice shows for a job that exited 0. */
+const NOTIFY_SUCCESS_LINES = 5;
+const SENT_CLEANUP_MS = 60_000;
 
 /** A finished job's thread gets a message; entries live in plugin kv. */
 type NotifyEntry = {
@@ -39,6 +42,18 @@ const SENT_TTL_MS = 24 * 3600 * 1000;
 
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
+  const settings = bb.settings.define({
+    notifyVisibility: {
+      type: "select",
+      label: "Who sees --notify messages",
+      options: ["agent-only", "visible"],
+      experimental_optionLabels: {
+        "agent-only": "Only the agent (the chat shows its reply)",
+        visible: "Agent and user (shown in the chat)",
+      },
+      default: "agent-only",
+    },
+  });
 
   /**
    * BB_* variables for a job started from a thread, when the job runs on the
@@ -122,9 +137,17 @@ export default async function plugin(bb: BbPluginApi) {
       sections.length === 1 ? "[bb jobs] A job ended." : `[bb jobs] ${sections.length} jobs ended.`;
     return [header, ...sections].join("\n\n");
   }
-  const noticeInput = (sections: string[]) => [
-    { type: "text" as const, text: noticeText(sections), mentions: [] },
-  ];
+  async function noticeInput(sections: string[]) {
+    const { notifyVisibility } = await settings.get();
+    return [
+      {
+        type: "text" as const,
+        text: noticeText(sections),
+        mentions: [],
+        ...(notifyVisibility === "agent-only" ? { visibility: "agent-only" as const } : {}),
+      },
+    ];
+  }
 
   /**
    * Make a still-queued notice match the sent entries that point at it:
@@ -151,7 +174,7 @@ export default async function plugin(bb: BbPluginApi) {
       threadId,
       queuedMessageId,
       expectedUpdatedAt: row.updatedAt,
-      input: noticeInput(ids.map((id) => sent[id]!.section)),
+      input: await noticeInput(ids.map((id) => sent[id]!.section)),
     });
   }
 
@@ -186,22 +209,65 @@ export default async function plugin(bb: BbPluginApi) {
     return { kind: "report", job, text };
   }
 
+  /** A short block per job: result line, where to look, and a tail of output. */
   function noticeSection(job: Job, hostId: string, text: string): string {
-    const result = job.state === "exited" ? `exited with code ${job.exitCode}` : job.state;
+    const result = job.state === "exited" ? `exited ${job.exitCode}` : job.state;
+    const seconds =
+      job.finishedAt !== null
+        ? (Date.parse(job.finishedAt) - Date.parse(job.createdAt)) / 1000
+        : null;
+    const took = seconds === null ? "" : ` after ${formatSeconds(seconds)}`;
+    const command = job.command.length > 120 ? `${job.command.slice(0, 120)}…` : job.command;
+    // The [jobs] start/exit lines repeat what the first line already says.
+    let lines = text
+      .trimEnd()
+      .split("\n")
+      .filter((line) => !/^\[jobs\] (started|exited) /.test(line));
+    const ok = job.state === "exited" && job.exitCode === 0;
+    if (ok) lines = lines.slice(-NOTIFY_SUCCESS_LINES);
+    const output = lines.join("\n").trim();
     return [
-      `Job ${job.id} ${result}.`,
-      `Command: ${job.command.length > 200 ? `${job.command.slice(0, 200)}…` : job.command}`,
-      `Started ${job.createdAt}${job.finishedAt ? `, ended ${job.finishedAt}` : ""}, cwd ${job.cwd}.`,
-      `Full log: bb jobs logs ${job.id} --machine ${hostId}`,
-      "Last output:",
-      "```",
-      text.trimEnd(),
-      "```",
+      `${job.id} ${result}${took}: ${command}`,
+      `Log: bb jobs logs ${job.id} --machine ${hostId} (cwd ${job.cwd})`,
+      ...(output ? ["```", output, "```"] : ["(no output)"]),
     ].join("\n");
+  }
+
+  /**
+   * Forget sent notices that are no longer waiting in their thread's queue
+   * (delivered, or deleted) and anything older than SENT_TTL_MS.
+   */
+  let lastSentCleanup = 0;
+  async function cleanupSent(): Promise<void> {
+    if (Date.now() - lastSentCleanup < SENT_CLEANUP_MS) return;
+    lastSentCleanup = Date.now();
+    await withSentLock(async () => {
+      const sent = await readSent();
+      const ids = Object.keys(sent);
+      if (!ids.length) return;
+      const now = Date.now();
+      const threads = new Set(ids.map((id) => sent[id]!.threadId));
+      for (const threadId of threads) {
+        const queued = await bb.sdk.threads.queuedMessages
+          .list({ threadId })
+          .catch(() => null);
+        for (const id of ids) {
+          const entry = sent[id];
+          if (!entry || entry.threadId !== threadId) continue;
+          const expired = now - Date.parse(entry.sentAt) > SENT_TTL_MS;
+          const gone = queued !== null && !queued.some((m) => m.id === entry.queuedMessageId);
+          if (expired || gone) delete sent[id];
+        }
+      }
+      await bb.storage.kv.set(SENT_KEY, sent);
+    });
   }
 
   /** One pass: every thread gets at most one message for all its ended jobs. */
   async function deliverNotices(signal: AbortSignal): Promise<void> {
+    await cleanupSent().catch((error: unknown) =>
+      bb.log.warn(`notify-sent cleanup failed: ${error instanceof Error ? error.message : String(error)}`),
+    );
     const entries = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
     const byThread = new Map<string, { id: string; section: string }[]>();
     const drops: string[] = [];
@@ -228,10 +294,6 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         await withSentLock(async () => {
           const sent = await readSent();
-          const now = Date.now();
-          for (const [id, entry] of Object.entries(sent)) {
-            if (now - Date.parse(entry.sentAt) > SENT_TTL_MS) delete sent[id];
-          }
           // Add to this thread's notice if it is still waiting in the queue.
           const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
           const waiting = queued.find((m) =>
@@ -244,7 +306,7 @@ export default async function plugin(bb: BbPluginApi) {
               threadId,
               queuedMessageId: waiting.id,
               expectedUpdatedAt: waiting.updatedAt,
-              input: noticeInput([
+              input: await noticeInput([
                 ...ids.map((id) => sent[id]!.section),
                 ...fresh.map((item) => item.section),
               ]),
@@ -255,7 +317,7 @@ export default async function plugin(bb: BbPluginApi) {
               threadId,
               mode: "queue-if-active",
               originPluginId: bb.pluginId,
-              input: noticeInput(fresh.map((item) => item.section)),
+              input: await noticeInput(fresh.map((item) => item.section)),
             });
             if (result.delivery === "queued") queuedMessageId = result.queuedMessage.id;
           }
@@ -931,6 +993,13 @@ export default async function plugin(bb: BbPluginApi) {
       },
     }),
   );
+}
+
+function formatSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${Math.round(seconds % 60)}s`;
+  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
 function describe(job: Job): string {

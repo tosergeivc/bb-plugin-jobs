@@ -61,7 +61,9 @@ All commands accept `--machine <id|name>` to target another machine and
   `list` shows only this thread's jobs unless `--all`.
 - When you read a finished job's result yourself (`wait`, `status`, `logs`,
   `ready`), its `--notify` message is cancelled; several jobs that end
-  together arrive as one message.
+  together arrive as one message. Notices start with `[bb jobs]`, may be
+  hidden from the user's chat, and show only the tail of the output: tell the
+  user the result, and read `bb jobs logs <id>` when you need more.
 - If the user views bb remotely, a server on `localhost` is not reachable for
   them: after it is ready, run `bb connect expose <port>` and give them the
   URL it prints.
