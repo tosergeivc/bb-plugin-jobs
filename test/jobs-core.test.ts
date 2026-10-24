@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { JobManager } from "../jobs-core.ts";
+
+function grepDir(dir: string, needle: string): string[] {
+  return readdirSync(dir).filter((f) => readFileSync(path.join(dir, f), "utf8").includes(needle));
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -93,6 +97,36 @@ for (const forceDetached of [false, true]) {
       assert.equal(done.exitCode, 6);
       await sleep(300);
       assert.equal(alive("^sleep 77$"), false, "watchdog sleep should be gone");
+    });
+
+    it("--env values reach the command but are not left on disk", async () => {
+      const secret = `s3cr3t-${forceDetached ? "d" : "s"}-'quoted' $notexpanded\nline2`;
+      const job = await jobs.start({
+        ...base,
+        name: "env",
+        command: 'printf "%s" "$TOKEN" | wc -c; echo "dir=$dir code=$code"; echo "envfile=${BBJOBS_ENV_FILE:-unset}"',
+        env: { TOKEN: secret, dir: "clobber", code: "77" },
+      });
+      const done = await until(() => jobs.get(job.id), (j) => j.state !== "running");
+      assert.equal(done.state, "exited");
+      assert.equal(done.exitCode, 0);
+      const { text } = await jobs.logs(job.id, 4096);
+      assert.match(text, new RegExp(`^\\s*${Buffer.byteLength(secret)}$`, "m"), text);
+      assert.match(text, /dir=clobber code=77/);
+      assert.match(text, /envfile=unset/);
+      const jobDir = path.dirname(done.logPath);
+      assert.equal(existsSync(path.join(jobDir, "env.sh")), false);
+      assert.deepEqual(grepDir(jobDir, "s3cr3t"), []);
+    });
+
+    it("--env file is removed when the job cannot start", async () => {
+      const gone = mkdtempSync(path.join(tmpdir(), "bbjobs-gone-"));
+      const job = await jobs.start({ ...base, cwd: gone, name: "nocd", command: "true", env: { TOKEN: "s3cr3t-nocd" } });
+      // remove cwd only after start validated it: the runner's cd fails
+      execFileSync("rmdir", [gone]);
+      const done = await until(() => jobs.get(job.id), (j) => j.state !== "running");
+      const jobDir = path.dirname(done.logPath);
+      assert.deepEqual(grepDir(jobDir, "s3cr3t"), []);
     });
 
     it("lists newest first", async () => {

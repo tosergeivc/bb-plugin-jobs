@@ -36,8 +36,10 @@ All commands accept `--machine <id|name>` to target another machine and
   Several tokens are quoted one by one: `bb jobs start -- npm run dev`.
 - The job gets no stdin. Pass answers with flags or env, never prompts.
 - The job inherits only PATH, HOME, USER, SHELL, LANG, TZ and SSH_AUTH_SOCK
-  from the machine; pass anything else with `--env`. Do not put secrets on the
-  command line; they land in `command.sh` inside the job directory (mode 0600).
+  from the machine; pass anything else with `--env`. `--env` values are not
+  kept on disk after the job starts. Pass a secret as `--env TOKEN="$TOKEN"`,
+  never literally, and never inside the command: the command is stored and
+  shown by `bb jobs status`.
 - After `start`, read the printed first output. For a deploy, follow with
   `bb jobs wait <id> --timeout 10m` and repeat `wait` until it is no longer
   running; report the exit code and the relevant log lines.

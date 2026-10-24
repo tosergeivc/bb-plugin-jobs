@@ -10,7 +10,9 @@
 //
 // On-disk layout, one directory per job under <root>/jobs/<id>/ (mode 0700):
 //   meta.json      static facts written at start
-//   command.sh     env exports + the user's command
+//   command.sh     env loader prelude + the user's command
+//   env.sh         --env exports; the job reads and deletes it as it starts,
+//                  so values live only in the job's process environment
 //   output.log     combined stdout/stderr (append)
 //   exit           exit code, written atomically by the runner when done
 //   stop-requested marker written by stop() before killing
@@ -23,6 +25,7 @@ import {
   open,
   readFile,
   readdir,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -75,9 +78,11 @@ const RUNNER = `#!/usr/bin/env bash
 dir="$1"
 log="$dir/output.log"
 finish() {
+  rm -f -- "$dir/env.sh"
   echo "$1" >"$dir/exit.tmp" && mv -f "$dir/exit.tmp" "$dir/exit"
   exit "$1"
 }
+export BBJOBS_ENV_FILE="$dir/env.sh"
 cd -- "$(cat "$dir/cwd")" 2>>"$log" || { echo "[jobs] cannot cd into $(cat "$dir/cwd")" >>"$log"; finish 127; }
 echo "[jobs] started $(date -u +%Y-%m-%dT%H:%M:%SZ) pid $$ in $PWD" >>"$log"
 t="$(cat "$dir/timeout" 2>/dev/null)"
@@ -109,6 +114,12 @@ else
 fi
 echo "[jobs] exited $code at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$log"
 finish "$code"
+`;
+
+// First lines of every command.sh: load the --env values in the job's own
+// shell and delete the file before the user's command runs.
+const ENV_PRELUDE = `if [ -n "\${BBJOBS_ENV_FILE:-}" ] && [ -f "$BBJOBS_ENV_FILE" ]; then . "$BBJOBS_ENV_FILE"; rm -f -- "$BBJOBS_ENV_FILE"; fi
+unset BBJOBS_ENV_FILE
 `;
 
 export function shellQuote(value: string): string {
@@ -175,12 +186,14 @@ export class JobManager {
     const id = `${slug(input.name)}-${randomBytes(3).toString("hex")}`;
     const dir = this.dir(id);
     await mkdir(dir, { mode: 0o700 });
+    const envFile = path.join(dir, "env.sh");
     const exports = Object.entries(input.env)
-      .map(([key, value]) => `export ${key}=${shellQuote(value)}`)
-      .join("\n");
+      .map(([key, value]) => `export ${key}=${shellQuote(value)}\n`)
+      .join("");
+    if (exports) await writeFile(envFile, exports, { mode: 0o600 });
     await writeFile(
       path.join(dir, "command.sh"),
-      `${exports}${exports ? "\n" : ""}${input.command}\n`,
+      `${ENV_PRELUDE}${input.command}\n`,
       { mode: 0o600 },
     );
     await writeFile(path.join(dir, "cwd"), input.cwd);
@@ -218,6 +231,7 @@ export class JobManager {
       try {
         await run("systemd-run", args, { env: base, timeout: 15000 });
       } catch (error) {
+        await rm(envFile, { force: true });
         throw new Error(`systemd-run failed: ${errorText(error)}`);
       }
       pid = await this.unitMainPid(unit);
@@ -234,6 +248,9 @@ export class JobManager {
       pid = await new Promise<number>((resolve, reject) => {
         child.once("error", reject);
         child.once("spawn", () => resolve(child.pid ?? -1));
+      }).catch(async (error: unknown) => {
+        await rm(envFile, { force: true });
+        throw error;
       });
       child.unref();
     }
@@ -367,6 +384,8 @@ export class JobManager {
     } else {
       state = stopRequested ? "stopped" : "lost";
     }
+    // A job killed before it read its --env file must not leave it behind.
+    if (state !== "running") await rm(path.join(dir, "env.sh"), { force: true });
     return {
       id: meta.id,
       name: meta.name,

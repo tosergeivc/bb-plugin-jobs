@@ -31,7 +31,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 Requires bb 0.46 or newer.
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.1.0
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.1.1
 ```
 
 bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
@@ -106,11 +106,11 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly):
 | `--timeout` ends the process group with code 124 | passed | passed |
 | Survives a full stop/update of the bb service | not yet observed | not tested |
 
-Unit tests (`npm test`) run every check against both modes on Linux: 14 tests.
+Unit tests (`npm test`) run every check against both modes on Linux: 18 tests, including that `--env` values reach the command and are not left in the job directory.
 
 ## Limitations
 
-- `--env` values are written to `command.sh` in the job directory (mode 0600) and stay there after the job ends. Do not pass secrets with `--env` or in the command; let the script read them from a file.
+- `--env` values are not kept on disk: they go to `env.sh` (mode 0600) in the job directory, and the job loads and deletes that file before the command runs. If the job never starts, the runner or the next `status`/`list` deletes it. The values still exist in the job's process environment (readable by the same OS user), and they pass through the `bb` command line, so prefer `--env TOKEN="$TOKEN"` (the shell expands it; the thread transcript shows `$TOKEN`) over typing a secret literally. The command itself is stored in `meta.json` and shown by `bb jobs status`: never put secrets in it.
 - `--timeout` needs `perl` (present on macOS and most Linux systems). Without it, a job with `--timeout` ends with code 125 instead of running unbounded.
 - Detached mode on Linux survives the end of a turn but not a stop of a bb service that uses `KillMode=control-group`.
 - Finished job directories are not removed automatically.
@@ -134,6 +134,11 @@ bb plugin install .
 | `server.ts` | `bb jobs` CLI |
 | `skills/background-jobs/SKILL.md` | Instructions bb gives to agents |
 | `test/` | Tests for both modes |
+
+## Changelog
+
+- **0.1.1** — `--env` values are no longer stored on disk after the job starts (were kept in `command.sh`). Jobs started with 0.1.0 keep their old `command.sh`.
+- **0.1.0** — first release.
 
 ## License
 
