@@ -11,6 +11,7 @@ A [bb](https://getbb.app) plugin that adds `bb jobs`: run dev servers, deploys, 
 - [Install](#install)
 - [Usage](#usage)
 - [How it works](#how-it-works)
+- [Works well with](#works-well-with)
 - [Similar plugins](#similar-plugins)
 - [What was tested](#what-was-tested)
 - [Limitations](#limitations)
@@ -39,7 +40,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.3.0
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.4.0
 ```
 
 bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
@@ -65,14 +66,15 @@ bb jobs prune --older-than 7d
 | `bb jobs start … --ready-url URL` / `--ready-log REGEX` [`--ready-timeout 60s`] | Start, then return only when the URL answers 2xx or a log line matches; exit 0 ready, 1 job ended, 124 not ready yet (job keeps running) |
 | `bb jobs start … --notify` / `--notify-thread THREAD` | When the job ends, post its result, command, times and last 2 KiB of output to the calling (or given) thread |
 | `bb jobs ready <id> --url URL` / `--log REGEX` [`--timeout 60s`] | The same readiness check for a job that is already running |
-| `bb jobs list [--running]` | Jobs on the machine, newest first |
+| `bb jobs list [--running] [--all]` | Jobs started from the calling thread, newest first; `--all` shows every thread's jobs on the machine (outside a thread, all jobs) |
 | `bb jobs status <id>` | State, exit code, command, log path |
-| `bb jobs logs <id> [--bytes N]` | End of the combined stdout/stderr log (default 16 KiB) |
+| `bb jobs logs <id> [--bytes N] [--raw]` | End of the combined stdout/stderr log (default 16 KiB), with terminal colour codes and progress-bar redraws removed unless `--raw` |
+| `bb jobs logs <id> --since N` | Only output written after cursor N, in whole lines while the job runs; each call prints `next: --since N` on stderr |
 | `bb jobs wait <id> [--timeout 5m]` | Wait up to 10 min; exit code mirrors the job, 124 if still running |
-| `bb jobs stop <id>` | SIGTERM the whole process tree, SIGKILL 15 s later |
+| `bb jobs stop <id> [--force]` | SIGTERM the whole process tree, SIGKILL 15 s later; another thread's running job needs `--force` |
 | `bb jobs prune --older-than 7d [--delete] [--dry-run]` | Move finished jobs that ended at least that long ago to the plugin's `archive/` directory, or delete them; running jobs are never touched |
 
-Every command accepts `--machine <id|name>`. Without it, the job runs on the machine of the calling thread. `start`, `list`, `status` and `prune` accept `--json`.
+Every command accepts `--machine <id|name>`. Without it, the job runs on the machine of the calling thread. `start`, `list`, `status`, `logs` and `prune` accept `--json`.
 
 Command rules:
 
@@ -120,7 +122,14 @@ agent Bash: bb jobs start ──► server.ts (bb server, CLI)
 - `exec.pl` runs the command in its own process group with output on a pipe, copies the pipe into `output.log` with the size cap, enforces `--timeout` (SIGTERM to the group, SIGKILL 15 s later, exit 124) and writes the exit code to `exit` atomically as soon as the command ends. It keeps copying while a leftover child still writes, so that child does not die of SIGPIPE. The job does not depend on the bb worker after it starts.
 - In detached mode no stored PID is trusted, because PIDs get reused. A process belongs to the job when its command line is exactly one of the job's own launch lines (`runner.sh`, `exec.pl`, `command.sh` in the job directory), when it descends from one, or when it is in the command's process group, started no earlier than the job, and that group's leader is the job's own process or already gone. A recycled PID, or a process that merely mentions the job directory (`tail -f …/output.log`), is never reported or signalled. macOS hides other processes' environments, so an environment marker cannot do this. In systemd mode the unit's cgroup defines the job.
 - Job files live in the plugin's data directory on the machine, `jobs/<id>/`, mode 0700.
-- `--notify` stores the job id, machine and thread in the plugin's server storage. A background service on the bb server checks those jobs every 5 seconds and, when one has ended, sends one message to the thread with `queue-if-active`: an active thread gets it after the current turn, an idle thread starts a new turn. Jobs stopped with `bb jobs stop`, jobs that no longer exist and deleted threads are dropped without a message.
+- `--notify` stores the job id, machine and thread in the plugin's server storage. A background service on the bb server checks those jobs every 5 seconds and sends each thread one message for all of its jobs that ended since the last check, with `queue-if-active`: an active thread gets it after the current turn, an idle thread starts a new turn. A notice is cancelled when the agent reads the finished result itself (`wait`, `status`, `logs`, `ready`, or `start` showing a fast failure). Jobs stopped with `bb jobs stop`, jobs that no longer exist and deleted threads are dropped without a message; a message bb rejects five times is dropped with a log line.
+- `logs --since` cursors count bytes from the job's start across log rotations (`log-base` in the job directory records the bytes rotated out), so a cursor stays valid after a rotation; output rotated away for good is reported as skipped bytes.
+
+## Works well with
+
+- [Lame duck](https://github.com/ymichael/bb-plugins) pauses new sends and lets active turns finish before you restart or update the bb server. `bb jobs` keeps its `--notify` list on the server, so notices for jobs that end during the restart are sent once the server is back.
+- [Env Catalog](https://github.com/VKirill/bb-plugin-env-catalog) keeps secrets encrypted on the bb server. Read a secret into a shell variable there and pass it as `--env NAME="$NAME"` rather than writing it into the command.
+- Claude Code has its own background Bash mode, and its processes end with the session like any other (observed on 23 October 2026). Claude Code 2.1.310 contains a `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` setting which, according to the [Shell tasks README](https://github.com/ahkohd/bb-plugin-shell-tasks#install), disables background Bash commands and subagents; set it with `printf '1\n' | bb machine env set CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` so agents use `bb jobs` instead. Its exact effect was not tested here.
 
 ## Similar plugins
 
@@ -129,7 +138,7 @@ Two plugins in the bb-community marketplace solve the same problem; as of 24 Oct
 - [Terminal Jobs](https://github.com/ryanbbrown/bb-plugin-terminal-jobs) runs each command in a bb terminal, records jobs in SQLite and notifies one owner thread.
 - [Shell tasks](https://github.com/ahkohd/bb-plugin-shell-tasks) adds a `task` agent tool and a per-thread panel, and batches completion messages.
 
-Both start the command from the bb daemon (`spawn` with `detached: true`). On Linux such a process stays in the bb service's cgroup, so a stop or update of a bb service with `KillMode=control-group` ends it too. `bb jobs` runs each job as its own `systemd-run --user` unit instead, and adds readiness checks, a log cap and PID-reuse protection. The other two offer things `bb jobs` does not: a UI panel (Shell tasks), and SQLite job records with notification retry (Terminal Jobs). If you install more than one, their agent skills compete; keep one.
+Both start the command from the bb daemon (`spawn` with `detached: true`). On Linux such a process stays in the bb service's cgroup, so a stop or update of a bb service with `KillMode=control-group` ends it too. `bb jobs` runs each job as its own `systemd-run --user` unit instead, and adds readiness checks, a log cap and PID-reuse protection; like Shell tasks it batches notices, cancels notices the agent already acted on, reads output by cursor and strips terminal codes. The other two offer things `bb jobs` does not: a UI panel and a native agent tool (Shell tasks), and SQLite job records with a manual notification retry (Terminal Jobs). If you install more than one, their agent skills compete; keep one.
 
 ## What was tested
 
@@ -143,9 +152,13 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on one Linux serve
 | `--timeout` ends the process group with code 124 | passed | passed |
 | `--ready-url` / `--ready-log`, log cap with rotation | passed | passed |
 | `--notify`: one message per ended job; none for a stopped job | passed | passed |
+| Notices batched per thread, withdrawn once the agent read the result, merged into a waiting notice (0.4.0) | passed | not tested |
+| `logs` without escape codes, `--since` cursor (0.4.0) | passed | not tested in 0.4.0 |
 | Survives a full stop/update of the bb service | not yet observed | not tested |
 
-Unit tests (`npm test`, run on Linux; a GitHub Actions workflow for Linux and macOS is prepared but not yet enabled): 30 tests, including `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
+Real-agent check (0.4.0, 24 October 2026): a Codex thread on the Linux server, given an ordinary task ("start a server that outlives your turn, run a 40-second deploy") without any mention of `bb jobs`, found the `background-jobs` skill, started the server with `--ready-url` and the deploy with `--notify`, and ended its turn. The server kept answering after the turn; the deploy's notice woke the idle thread, which reported exit 0 and its output. The Codex sandbox did not block the `bb` CLI. Another thread's `bb jobs stop` on that server was refused without `--force`.
+
+Unit tests (`npm test`, run on Linux; a GitHub Actions workflow for Linux and macOS is prepared but not yet enabled): 37 tests, including terminal-code cleaning, cursor reads across log rotation, including `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
 
 ## Limitations
 
@@ -180,6 +193,7 @@ bb plugin install .
 
 ## Changelog
 
+- **0.4.0** — `logs` removes terminal colour codes and progress-bar redraws (`--raw` keeps them) and reads by cursor (`--since`, `next:` line, `--json`); `--ready-log` now matches the cleaned text; one notice per thread for jobs that end together, cancelled when the agent already read the result; `list` shows the calling thread's jobs (`--all` for every thread); `stop` refuses another thread's running job without `--force`; skill: `bb connect expose` for remote viewers; README: works well with Lame duck, Env Catalog, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`.
 - **0.3.0** — `--notify` / `--notify-thread`: a message to the thread when a job ends; jobs get `BB_THREAD_ID`, `BB_PROJECT_ID`, `BB_ENVIRONMENT_ID`, `BB_THREAD_STORAGE`; `bb jobs start` warns when systemd user lingering is off; native Windows machines are refused with a clear error; `[jobs]` lines always start on their own line; tests run on macOS too (no `setsid` binary needed); `PLUGIN_OVERVIEW.md`. The short description no longer claims that jobs survive a bb restart, which is still unverified.
 - **0.2.0** — `--ready-url` / `--ready-log` on `start` and `bb jobs ready`; log cap with rotation (`--log-max`, default 50 MiB); `bb jobs prune`; detached jobs identified by their launch lines and process group instead of a stored PID, so a recycled PID is never reported or stopped; per-job runner copy (a shared runner rewritten by a later `start` could corrupt running jobs); the exit code is recorded even when a leftover child keeps the output open.
 - **0.1.1** — `--env` values are no longer stored on disk after the job starts (were kept in `command.sh`). Jobs started with 0.1.0 keep their old `command.sh`.

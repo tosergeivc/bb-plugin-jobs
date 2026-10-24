@@ -51,7 +51,13 @@ export const hostContract = defineRpcContract({
     output: jobSchema.extend({ warnings: z.array(z.string()) }),
   },
   list: {
-    input: z.object({ limit: z.number().int().min(1).max(500) }).strict(),
+    input: z
+      .object({
+        limit: z.number().int().min(1).max(500),
+        // Only jobs started from this thread; null = every job on the machine.
+        threadId: z.string().nullable(),
+      })
+      .strict(),
     output: z.object({ jobs: z.array(jobSchema) }).strict(),
   },
   get: {
@@ -60,10 +66,23 @@ export const hostContract = defineRpcContract({
   },
   logs: {
     input: z
-      .object({ id: jobId, maxBytes: z.number().int().min(1).max(512 * 1024) })
+      .object({
+        id: jobId,
+        maxBytes: z.number().int().min(1).max(512 * 1024),
+        // Continue after this cursor (from an earlier logs call); null = tail.
+        since: z.number().int().min(0).nullable(),
+        // Keep terminal escape codes and carriage-return redraws.
+        raw: z.boolean(),
+      })
       .strict(),
     output: z
-      .object({ job: jobSchema, text: z.string(), truncated: z.boolean() })
+      .object({
+        job: jobSchema,
+        text: z.string(),
+        truncated: z.boolean(),
+        cursor: z.number().int(),
+        skippedBytes: z.number().int(),
+      })
       .strict(),
   },
   stop: {

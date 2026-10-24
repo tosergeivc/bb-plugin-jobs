@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { JobManager } from "../jobs-core.ts";
+import { JobManager, cleanTerminalText } from "../jobs-core.ts";
 
 function grepDir(dir: string, needle: string): string[] {
   return readdirSync(dir).filter((f) => readFileSync(path.join(dir, f), "utf8").includes(needle));
@@ -40,6 +40,16 @@ function alive(pattern: string): boolean {
     return false;
   }
 }
+
+describe("cleanTerminalText", () => {
+  it("drops colour and OSC codes and keeps the last redraw of a line", () => {
+    const raw = "\x1b[32m✓ built\x1b[0m in \x1b[1m1.2s\x1b[0m\n" +
+      "\x1b]0;title\x07progress 10%\rprogress 50%\rprogress 100%\n" +
+      "windows line\r\n" +
+      "\x1b[2K\x1b[1Gdone";
+    assert.equal(cleanTerminalText(raw), "✓ built in 1.2s\nprogress 100%\nwindows line\ndone");
+  });
+});
 
 for (const forceDetached of [false, true]) {
   describe(forceDetached ? "detached mode" : "default mode (systemd on Linux)", () => {
@@ -260,6 +270,60 @@ for (const forceDetached of [false, true]) {
       await until(() => jobs.get(job.id), (j) => j.state !== "running");
       const { text } = await jobs.logs(job.id, 4096);
       assert.match(text, /^thr_test\|\/tmp\/store\n\[jobs\] exited 0 /m, text);
+    });
+
+    it("logs --since returns only new whole lines and a cursor to continue from", async () => {
+      const job = await jobs.start({
+        ...base,
+        name: "cursor",
+        command: 'echo one; echo two; sleep 1.5; printf "three\n\033[31mfour\033[0m\n"; sleep 1; printf "partial"; sleep 1; echo " line"',
+      });
+      await sleep(800);
+      const first = await jobs.logs(job.id, 4096, { since: 0 });
+      assert.match(first.text, /one\ntwo\n$/);
+      const second = await until(() => jobs.logs(job.id, 4096, { since: first.cursor }), (r) => r.text.includes("four"));
+      assert.equal(second.text, "three\nfour\n", "only new lines, colour removed");
+      // While "partial" has no newline yet, it is held back.
+      await sleep(600);
+      const held = await jobs.logs(job.id, 4096, { since: second.cursor });
+      assert.ok(!held.text.includes("partial"), held.text);
+      await until(() => jobs.get(job.id), (j) => j.state !== "running");
+      const rest = await jobs.logs(job.id, 4096, { since: held.cursor });
+      assert.match(rest.text, /^partial line\n\[jobs\] exited 0 /);
+      const raw = await jobs.logs(job.id, 4096, { raw: true });
+      assert.ok(raw.text.includes("\x1b[31m"), "--raw keeps escape codes");
+    });
+
+    it("logs --since pages through rotated output and reports what was rotated away", async () => {
+      const job = await jobs.start({
+        ...base,
+        name: "pages",
+        command: 'for i in $(seq 1 3000); do printf "row %05d\n" "$i"; done',
+        logMaxBytes: 10000,
+      });
+      await until(() => jobs.get(job.id), (j) => j.state !== "running");
+      const lost = await jobs.logs(job.id, 4096, { since: 0 });
+      assert.ok(lost.skippedBytes > 0, "early output was rotated away");
+      const rows: string[] = [];
+      let cursor = 0;
+      for (let i = 0; i < 50; i++) {
+        const page = await jobs.logs(job.id, 4096, { since: cursor });
+        rows.push(...page.text.split("\n").filter((l) => l.startsWith("row ")));
+        if (page.cursor === cursor) break;
+        cursor = page.cursor;
+      }
+      assert.equal(rows.at(-1), "row 03000");
+      const numbers = rows.map((r) => Number(r.slice(4)));
+      for (let i = 1; i < numbers.length; i++) assert.equal(numbers[i], numbers[i - 1]! + 1, "no gaps or repeats");
+    });
+
+    it("list filters by thread", async () => {
+      const mine = await jobs.start({ ...base, name: "mine", command: "true", threadId: "thr_a" });
+      const other = await jobs.start({ ...base, name: "other", command: "true", threadId: "thr_b" });
+      const ids = (await jobs.list(500, "thr_a")).map((j) => j.id);
+      assert.ok(ids.includes(mine.id));
+      assert.ok(!ids.includes(other.id));
+      assert.ok((await jobs.list(500)).some((j) => j.id === other.id));
     });
 
     it("lists newest first", async () => {

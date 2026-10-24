@@ -15,12 +15,12 @@ export default experimental_defineHostEntry({
   handlers: {
     start: (input, ctx) =>
       jobs(ctx.experimental_paths.dataDir).startWithChecks(input),
-    list: async ({ limit }, ctx) => ({
-      jobs: await jobs(ctx.experimental_paths.dataDir).list(limit),
+    list: async ({ limit, threadId }, ctx) => ({
+      jobs: await jobs(ctx.experimental_paths.dataDir).list(limit, threadId),
     }),
     get: ({ id }, ctx) => jobs(ctx.experimental_paths.dataDir).get(id),
-    logs: ({ id, maxBytes }, ctx) =>
-      jobs(ctx.experimental_paths.dataDir).logs(id, maxBytes),
+    logs: ({ id, maxBytes, since, raw }, ctx) =>
+      jobs(ctx.experimental_paths.dataDir).logs(id, maxBytes, { since, raw }),
     stop: ({ id }, ctx) => jobs(ctx.experimental_paths.dataDir).stop(id),
     ready: ({ id, url, logPattern, timeoutMs }, ctx) =>
       jobs(ctx.experimental_paths.dataDir).ready(id, { url, logPattern }, timeoutMs),

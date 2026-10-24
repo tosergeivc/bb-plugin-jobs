@@ -16,6 +16,7 @@
 //   env.sh         --env exports; the job reads and deletes it as it starts,
 //                  so values live only in the job's process environment
 //   output.log     combined stdout/stderr; output.log.1 after a rotation
+//   log-base       bytes written before the current output.log (cursors)
 //   exit           exit code, written atomically when the command ends
 //   pgid           process group of the command, written by exec.pl
 //   stop-requested marker written by stop() before killing
@@ -76,6 +77,14 @@ interface JobMeta {
   /** 2 for jobs started by 0.2.0+ (process ownership by launch lines). */
   format?: number;
 }
+
+export type LogsResult = {
+  job: Job;
+  text: string;
+  truncated: boolean;
+  cursor: number;
+  skippedBytes: number;
+};
 
 export type ReadyResult = {
   outcome: "ready" | "exited" | "timeout";
@@ -146,7 +155,13 @@ sub put {
   $atlinestart = substr($_[0], -1) eq "\n";
   if ($max > 0 && tell($fh) >= $max) {
     close $fh;
+    # log-base = bytes written before output.log; readers map cursors with it.
+    my $base = 0;
+    if (open(my $b, '<', "$dir/log-base")) { $base = int(<$b> // 0); close $b; }
+    $base += -s $log;
+    if (open(my $b, '>', "$dir/log-base.tmp")) { print $b "$base\n"; close $b; }
     rename $log, "$log.1";
+    rename "$dir/log-base.tmp", "$dir/log-base";
     reopen();
     $atlinestart = 1;
     note("log reached $max bytes, previous part moved to output.log.1 at " . stamp());
@@ -410,8 +425,11 @@ export class JobManager {
     return this.get(id);
   }
 
-  async list(limit: number): Promise<Job[]> {
-    const metas = await this.readAllMeta();
+  /** Newest first; with `threadId`, only jobs started from that thread. */
+  async list(limit: number, threadId: string | null = null): Promise<Job[]> {
+    const metas = (await this.readAllMeta()).filter(
+      (m) => threadId === null || m.threadId === threadId,
+    );
     metas.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return Promise.all(metas.slice(0, limit).map((m) => this.describe(m)));
   }
@@ -420,26 +438,82 @@ export class JobManager {
     return this.describe(await this.readMeta(id));
   }
 
+  /**
+   * Without `since`: the last `maxBytes` of output. With `since` (a cursor
+   * from an earlier call): up to `maxBytes` of output after it, ending on a
+   * line boundary while the job runs. `cursor` is where the next call should
+   * continue; it counts bytes from the job's start, across log rotations.
+   * Output is cleaned of terminal escape codes unless `raw`.
+   */
   async logs(
     id: string,
     maxBytes: number,
-  ): Promise<{ job: Job; text: string; truncated: boolean }> {
+    options: { since?: number | null; raw?: boolean } = {},
+  ): Promise<LogsResult> {
     const job = await this.get(id);
-    const current = await readTail(job.logPath, maxBytes);
-    let text = current.text;
-    let truncated = current.clipped;
-    // After a rotation the newest part may be short; fill from output.log.1.
-    if (!truncated && current.bytes < maxBytes) {
-      const previous = await readTail(
-        `${job.logPath}.1`,
-        maxBytes - current.bytes,
-      ).catch(() => null);
-      if (previous && previous.bytes > 0) {
-        text = previous.text + text;
-        truncated = previous.clipped;
+    const dir = path.dirname(job.logPath);
+    const base = Number.parseInt(
+      await readFile(path.join(dir, "log-base"), "utf8").catch(() => "0"),
+      10,
+    ) || 0;
+    const currentSize = (await stat(job.logPath).catch(() => null))?.size ?? 0;
+    const previousSize = (await stat(`${job.logPath}.1`).catch(() => null))?.size ?? 0;
+    const end = base + currentSize;
+    const finish = (text: string, truncated: boolean, cursor: number, skippedBytes = 0) => ({
+      job,
+      text: options.raw ? text : cleanTerminalText(text),
+      truncated,
+      cursor,
+      skippedBytes,
+    });
+
+    if (options.since === undefined || options.since === null) {
+      const current = await readTail(job.logPath, maxBytes);
+      let text = current.text;
+      let truncated = current.clipped;
+      // After a rotation the newest part may be short; fill from output.log.1.
+      if (!truncated && current.bytes < maxBytes) {
+        const previous = await readTail(`${job.logPath}.1`, maxBytes - current.bytes).catch(
+          () => null,
+        );
+        if (previous && previous.bytes > 0) {
+          text = previous.text + text;
+          truncated = previous.clipped;
+        }
       }
+      return finish(text, truncated, end);
     }
-    return { job, text, truncated };
+
+    const previousStart = base - previousSize;
+    let since = Math.min(Math.max(0, options.since), end);
+    let skippedBytes = 0;
+    if (since < previousStart) {
+      // That output was rotated away for good.
+      skippedBytes = previousStart - since;
+      since = previousStart;
+    }
+    const chunks: Buffer[] = [];
+    let want = maxBytes;
+    if (since < base) {
+      const part = await readRange(`${job.logPath}.1`, since - previousStart, want);
+      chunks.push(part);
+      want -= part.length;
+    }
+    if (want > 0) {
+      const from = Math.max(0, since - base);
+      const part = await readRange(job.logPath, from, want);
+      chunks.push(part);
+    }
+    let buffer = Buffer.concat(chunks);
+    const atEnd = since + buffer.length >= end;
+    if (!atEnd || job.state === "running") {
+      // Return whole lines only; the rest comes with the next call.
+      const lastNewline = buffer.lastIndexOf(0x0a);
+      if (lastNewline >= 0) buffer = buffer.subarray(0, lastNewline + 1);
+      else if (atEnd) buffer = buffer.subarray(0, 0); // unfinished line: wait
+      // else: one line longer than maxBytes; return it in pieces
+    }
+    return finish(buffer.toString("utf8"), !atEnd, since + buffer.length, skippedBytes);
   }
 
   async stop(id: string): Promise<Job> {
@@ -501,7 +575,7 @@ export class JobManager {
         }
       }
       if (pattern) {
-        const { text } = await this.logs(id, 256 * 1024);
+        const { text } = await this.logs(id, 256 * 1024); // escape codes removed
         const match = text.match(pattern);
         if (match) {
           const line = text.slice(0, match.index! + match[0].length).split("\n").pop()!;
@@ -770,6 +844,41 @@ function legacyGroupAlive(pgid: number): boolean {
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+// CSI (colours, cursor moves), OSC (titles, hyperlinks) and other ESC sequences.
+const ANSI_PATTERN =
+  /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
+
+/**
+ * Text as a terminal would show it: no escape codes, and for lines redrawn
+ * with carriage returns (progress bars) only the last version of the line.
+ */
+export function cleanTerminalText(text: string): string {
+  return text
+    .replace(ANSI_PATTERN, "")
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
+      const parts = trimmed.split("\r");
+      for (let i = parts.length - 1; i >= 0; i--) if (parts[i] !== "") return parts[i];
+      return "";
+    })
+    .join("\n");
+}
+
+async function readRange(file: string, from: number, maxBytes: number): Promise<Buffer> {
+  const handle = await open(file, "r").catch(() => null);
+  if (!handle) return Buffer.alloc(0);
+  try {
+    const { size } = await handle.stat();
+    const length = Math.max(0, Math.min(maxBytes, size - from));
+    const buffer = Buffer.alloc(length);
+    if (length > 0) await handle.read(buffer, 0, length, from);
+    return buffer;
+  } finally {
+    await handle.close();
   }
 }
 

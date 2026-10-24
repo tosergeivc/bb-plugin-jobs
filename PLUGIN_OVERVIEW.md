@@ -2,9 +2,10 @@ An agent that starts a dev server or a deploy from its Bash tool loses it when t
 
 ## What you get
 
-- `bb jobs start -- <command>` starts a job and prints its id and first output. `bb jobs status`, `logs`, `wait`, `list` and `stop` manage it; `stop` ends the whole process tree.
+- `bb jobs start -- <command>` starts a job and prints its id and first output. `bb jobs status`, `logs`, `wait`, `list` and `stop` manage it; `stop` ends the whole process tree. `list` shows the calling thread's jobs, and another thread's job needs `--force` to stop.
 - `--ready-url` or `--ready-log` makes `start` return only once a server answers or prints a given line, with distinct exit codes for ready, crashed and not yet.
-- `--notify` posts the job's result and last output to the thread when it ends, so the agent does not have to poll.
+- `--notify` posts the job's result and last output to the thread when it ends, so the agent does not have to poll. Jobs that end together arrive as one message, and a notice is cancelled once the agent has read the result itself.
+- `bb jobs logs --since <cursor>` returns only new output, and logs come without terminal colour codes, so agents spend fewer tokens on long jobs.
 - Logs are capped (`--log-max`, default 50 MiB, rotated once). `bb jobs prune` archives or deletes old jobs.
 - A `background-jobs` skill tells agents to use `bb jobs` instead of `&`, `nohup` or a provider's own background mode.
 

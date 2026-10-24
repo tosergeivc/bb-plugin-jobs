@@ -19,8 +19,23 @@ const NOTIFY_KEY = "notify";
 const NOTIFY_POLL_MS = 5000;
 const NOTIFY_TAIL_BYTES = 2048;
 
-/** A finished job's thread gets one message; entries live in plugin kv. */
-type NotifyEntry = { hostId: string; threadId: string; addedAt: string };
+/** A finished job's thread gets a message; entries live in plugin kv. */
+type NotifyEntry = {
+  hostId: string;
+  threadId: string;
+  addedAt: string;
+  /** Failed send attempts; the entry is dropped after NOTIFY_MAX_FAILURES. */
+  failures?: number;
+};
+const NOTIFY_MAX_FAILURES = 5;
+/**
+ * Notices sent but still waiting in the thread's queue (the thread was busy).
+ * While queued they can be edited: a job the agent has read in the meantime
+ * is taken out, and jobs that end later are added to the same message.
+ */
+const SENT_KEY = "notify-sent";
+type SentEntry = { threadId: string; queuedMessageId: string; section: string; sentAt: string };
+const SENT_TTL_MS = 24 * 3600 * 1000;
 
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -66,60 +81,218 @@ export default async function plugin(bb: BbPluginApi) {
     return next;
   }
 
-  /** Tell the owning thread that a job ended. Returns true when done with it. */
-  async function deliverNotice(id: string, entry: NotifyEntry): Promise<boolean> {
+  /**
+   * The agent saw a job's final state itself (wait, status, logs, ready or a
+   * fast failure at start), so a notice would only cost it another turn.
+   */
+  async function acknowledge(job: Job, threadId: string | undefined): Promise<void> {
+    if (!threadId || job.state === "running") return;
+    const entries = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
+    if (entries[job.id]?.threadId === threadId) {
+      await updateNotify((all) => void delete all[job.id]);
+    }
+    const sent = await readSent().catch(() => ({}) as Record<string, SentEntry>);
+    const mine = sent[job.id];
+    if (mine?.threadId === threadId) {
+      await withSentLock(async () => {
+        const all = await readSent();
+        const entry = all[job.id];
+        if (!entry) return;
+        delete all[job.id];
+        await rewriteQueuedNotice(entry.threadId, entry.queuedMessageId, all);
+        await bb.storage.kv.set(SENT_KEY, all);
+      }).catch((error: unknown) =>
+        bb.log.warn(`withdrawing notice for ${job.id} failed: ${String(error)}`),
+      );
+    }
+  }
+
+  async function readSent(): Promise<Record<string, SentEntry>> {
+    return (await bb.storage.kv.get<Record<string, SentEntry>>(SENT_KEY)) ?? {};
+  }
+  let sentLock: Promise<unknown> = Promise.resolve();
+  function withSentLock<T>(work: () => Promise<T>): Promise<T> {
+    const next = sentLock.then(work);
+    sentLock = next.catch(() => undefined);
+    return next;
+  }
+
+  function noticeText(sections: string[]): string {
+    const header =
+      sections.length === 1 ? "[bb jobs] A job ended." : `[bb jobs] ${sections.length} jobs ended.`;
+    return [header, ...sections].join("\n\n");
+  }
+  const noticeInput = (sections: string[]) => [
+    { type: "text" as const, text: noticeText(sections), mentions: [] },
+  ];
+
+  /**
+   * Make a still-queued notice match the sent entries that point at it:
+   * update its text, or delete it when no job is left in it. A notice that
+   * was already delivered is left alone and its entries are dropped.
+   */
+  async function rewriteQueuedNotice(
+    threadId: string,
+    queuedMessageId: string,
+    sent: Record<string, SentEntry>,
+  ): Promise<void> {
+    const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+    const row = queued.find((m) => m.id === queuedMessageId);
+    const ids = Object.keys(sent).filter((id) => sent[id]!.queuedMessageId === queuedMessageId);
+    if (!row) {
+      for (const id of ids) delete sent[id];
+      return;
+    }
+    if (!ids.length) {
+      await bb.sdk.threads.queuedMessages.delete({ threadId, queuedMessageId });
+      return;
+    }
+    await bb.sdk.threads.queuedMessages.update({
+      threadId,
+      queuedMessageId,
+      expectedUpdatedAt: row.updatedAt,
+      input: noticeInput(ids.map((id) => sent[id]!.section)),
+    });
+  }
+
+  type NoticeCheck =
+    | { kind: "pending" }
+    | { kind: "drop" }
+    | { kind: "report"; job: Job; text: string };
+
+  /** Is the job done, and is anyone left to tell? */
+  async function checkNotice(id: string, entry: NotifyEntry): Promise<NoticeCheck> {
     let job: Job;
     try {
       job = await host.call("get", { id }, { hostId: entry.hostId, timeoutMs: 15_000 });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // The job is gone (pruned, wrong machine): nothing left to report.
-      if (/no job with id/.test(message)) return true;
-      return false; // machine offline or worker busy: try again later
+      if (/no job with id/.test(message)) return { kind: "drop" };
+      return { kind: "pending" }; // machine offline or worker busy: try later
     }
-    if (job.state === "running") return false;
+    if (job.state === "running") return { kind: "pending" };
     // Stopped through `bb jobs stop`: whoever stopped it already knows.
-    if (job.state === "stopped") return true;
+    if (job.state === "stopped") return { kind: "drop" };
     const thread = await bb.sdk.threads.get({ threadId: entry.threadId }).catch(() => null);
-    if (!thread) return true; // the thread was deleted
+    if (!thread) return { kind: "drop" }; // the thread was deleted
     const { text } = await host
-      .call("logs", { id, maxBytes: NOTIFY_TAIL_BYTES }, { hostId: entry.hostId, timeoutMs: 15_000 })
+      .call(
+        "logs",
+        { id, maxBytes: NOTIFY_TAIL_BYTES, since: null, raw: false },
+        { hostId: entry.hostId, timeoutMs: 15_000 },
+      )
       .catch(() => ({ text: "" }));
+    return { kind: "report", job, text };
+  }
+
+  function noticeSection(job: Job, hostId: string, text: string): string {
     const result = job.state === "exited" ? `exited with code ${job.exitCode}` : job.state;
-    const lines = [
-      `[bb jobs] Job ${job.id} ${result}.`,
+    return [
+      `Job ${job.id} ${result}.`,
       `Command: ${job.command.length > 200 ? `${job.command.slice(0, 200)}…` : job.command}`,
       `Started ${job.createdAt}${job.finishedAt ? `, ended ${job.finishedAt}` : ""}, cwd ${job.cwd}.`,
-      `Full log: bb jobs logs ${job.id}${entry.hostId ? ` --machine ${entry.hostId}` : ""}`,
-      "",
+      `Full log: bb jobs logs ${job.id} --machine ${hostId}`,
       "Last output:",
       "```",
       text.trimEnd(),
       "```",
-    ];
-    await bb.sdk.threads.send({
-      threadId: entry.threadId,
-      mode: "queue-if-active",
-      originPluginId: bb.pluginId,
-      input: [{ type: "text", text: lines.join("\n"), mentions: [] }],
-    });
-    return true;
+    ].join("\n");
+  }
+
+  /** One pass: every thread gets at most one message for all its ended jobs. */
+  async function deliverNotices(signal: AbortSignal): Promise<void> {
+    const entries = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
+    const byThread = new Map<string, { id: string; section: string }[]>();
+    const drops: string[] = [];
+    for (const [id, entry] of Object.entries(entries)) {
+      if (signal.aborted) return;
+      const check = await checkNotice(id, entry).catch((error: unknown) => {
+        bb.log.warn(`notice check for ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
+        return { kind: "pending" } as const;
+      });
+      if (check.kind === "drop") drops.push(id);
+      if (check.kind === "report") {
+        const list = byThread.get(entry.threadId) ?? [];
+        list.push({ id, section: noticeSection(check.job, entry.hostId, check.text) });
+        byThread.set(entry.threadId, list);
+      }
+    }
+    if (drops.length) await updateNotify((all) => drops.forEach((id) => delete all[id]));
+    for (const [threadId, items] of byThread) {
+      if (signal.aborted) return;
+      // The agent may have acknowledged a job while we were checking.
+      const current = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
+      const fresh = items.filter((item) => current[item.id]);
+      if (!fresh.length) continue;
+      try {
+        await withSentLock(async () => {
+          const sent = await readSent();
+          const now = Date.now();
+          for (const [id, entry] of Object.entries(sent)) {
+            if (now - Date.parse(entry.sentAt) > SENT_TTL_MS) delete sent[id];
+          }
+          // Add to this thread's notice if it is still waiting in the queue.
+          const queued = await bb.sdk.threads.queuedMessages.list({ threadId });
+          const waiting = queued.find((m) =>
+            Object.values(sent).some((e) => e.threadId === threadId && e.queuedMessageId === m.id),
+          );
+          let queuedMessageId: string | null = null;
+          if (waiting) {
+            const ids = Object.keys(sent).filter((id) => sent[id]!.queuedMessageId === waiting.id);
+            await bb.sdk.threads.queuedMessages.update({
+              threadId,
+              queuedMessageId: waiting.id,
+              expectedUpdatedAt: waiting.updatedAt,
+              input: noticeInput([
+                ...ids.map((id) => sent[id]!.section),
+                ...fresh.map((item) => item.section),
+              ]),
+            });
+            queuedMessageId = waiting.id;
+          } else {
+            const result = await bb.sdk.threads.send({
+              threadId,
+              mode: "queue-if-active",
+              originPluginId: bb.pluginId,
+              input: noticeInput(fresh.map((item) => item.section)),
+            });
+            if (result.delivery === "queued") queuedMessageId = result.queuedMessage.id;
+          }
+          if (queuedMessageId) {
+            for (const item of fresh) {
+              sent[item.id] = {
+                threadId,
+                queuedMessageId,
+                section: item.section,
+                sentAt: new Date().toISOString(),
+              };
+            }
+          }
+          await bb.storage.kv.set(SENT_KEY, sent);
+        });
+        await updateNotify((all) => fresh.forEach((item) => delete all[item.id]));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        bb.log.warn(`notice to ${threadId} failed: ${message}`);
+        await updateNotify((all) => {
+          for (const item of fresh) {
+            const entry = all[item.id];
+            if (!entry) continue;
+            entry.failures = (entry.failures ?? 0) + 1;
+            if (entry.failures >= NOTIFY_MAX_FAILURES) delete all[item.id];
+          }
+        });
+      }
+    }
   }
 
   bb.background.service("notify", {
     async start(signal) {
       while (!signal.aborted) {
-        const entries = await readNotify().catch(() => ({}));
-        for (const [id, entry] of Object.entries(entries)) {
-          if (signal.aborted) break;
-          let done = false;
-          try {
-            done = await deliverNotice(id, entry);
-          } catch (error) {
-            bb.log.warn(`notice for ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
-          }
-          if (done) await updateNotify((all) => void delete all[id]);
-        }
+        await deliverNotices(signal).catch((error: unknown) =>
+          bb.log.warn(`notify pass failed: ${error instanceof Error ? error.message : String(error)}`),
+        );
         await new Promise<void>((resolve) => {
           const timer = setTimeout(resolve, NOTIFY_POLL_MS);
           signal.addEventListener("abort", () => {
@@ -238,6 +411,7 @@ export default async function plugin(bb: BbPluginApi) {
     timeoutMs: number,
     hostId: string,
     signal?: AbortSignal,
+    threadId?: string,
   ) {
     const result = await call(
       "ready",
@@ -246,7 +420,13 @@ export default async function plugin(bb: BbPluginApi) {
       signal,
       timeoutMs + 30_000,
     );
-    const { text } = await call("logs", { id, maxBytes: 4096 }, hostId, signal);
+    const { text } = await call(
+      "logs",
+      { id, maxBytes: 4096, since: null, raw: false },
+      hostId,
+      signal,
+    );
+    await acknowledge(result.job, threadId);
     const exitCode =
       result.outcome === "ready" ? 0 : result.outcome === "timeout" ? 124 : 1;
     const verdict =
@@ -400,6 +580,7 @@ export default async function plugin(bb: BbPluginApi) {
                 input.options["ready-timeout"],
                 hostId,
                 ctx.signal,
+                ctx.threadId,
               );
               if (input.options.json) {
                 const now = await call("get", { id: job.id }, hostId, ctx.signal);
@@ -414,10 +595,11 @@ export default async function plugin(bb: BbPluginApi) {
             await new Promise((r) => setTimeout(r, 1500));
             const { job: now, text } = await call(
               "logs",
-              { id: job.id, maxBytes: 4096 },
+              { id: job.id, maxBytes: 4096, since: null, raw: false },
               hostId,
               ctx.signal,
             );
+            await acknowledge(now, ctx.threadId);
             if (input.options.json) {
               return {
                 exitCode: 0,
@@ -451,14 +633,20 @@ export default async function plugin(bb: BbPluginApi) {
               type: "boolean",
               description: "Only running jobs",
             },
+            all: {
+              type: "boolean",
+              description:
+                "Jobs of every thread on the machine. Default from a thread: only that thread's jobs",
+            },
             machine: machineOption,
             json: jsonOption,
           },
           async run(input, ctx) {
             const hostId = await resolveHost(input.options.machine, ctx.threadId);
+            const threadId = input.options.all ? null : (ctx.threadId ?? null);
             const { jobs } = await call(
               "list",
-              { limit: input.options.limit },
+              { limit: input.options.limit, threadId },
               hostId,
               ctx.signal,
             );
@@ -468,7 +656,14 @@ export default async function plugin(bb: BbPluginApi) {
             if (input.options.json) {
               return { exitCode: 0, stdout: JSON.stringify(shown, null, 2) };
             }
-            if (!shown.length) return { exitCode: 0, stdout: "No jobs.\n" };
+            if (!shown.length) {
+              return {
+                exitCode: 0,
+                stdout: threadId
+                  ? "No jobs from this thread. Add --all for every thread's jobs.\n"
+                  : "No jobs.\n",
+              };
+            }
             return {
               exitCode: 0,
               stdout: shown.map((j) => describe(j)).join("\n") + "\n",
@@ -487,6 +682,7 @@ export default async function plugin(bb: BbPluginApi) {
               hostId,
               ctx.signal,
             ).catch(notFound);
+            await acknowledge(job, ctx.threadId);
             return {
               exitCode: 0,
               stdout: input.options.json
@@ -496,7 +692,9 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
         logs: cliCommand({
-          summary: "Print the end of a job's output",
+          summary: "Print a job's output: the end, or only what is new since a cursor",
+          description:
+            "Without --since, prints the end of the log. Every call ends with a `next: --since N` line on stderr; pass N back to get only the output written after it, in whole lines. Terminal colour codes and progress-bar redraws are removed unless --raw.",
           positionals: [{ name: "id", description: "Job id", required: true }],
           options: {
             bytes: {
@@ -504,24 +702,58 @@ export default async function plugin(bb: BbPluginApi) {
               min: 1,
               max: LOG_MAX_BYTES,
               default: LOG_DEFAULT_BYTES,
-              description: `Bytes from the end of the log (max ${LOG_MAX_BYTES})`,
+              description: `At most this many bytes (default ${LOG_DEFAULT_BYTES}, max ${LOG_MAX_BYTES})`,
+            },
+            since: {
+              type: "integer",
+              min: 0,
+              max: Number.MAX_SAFE_INTEGER,
+              description: "Cursor from an earlier `next: --since N`; prints only newer output",
+              aliases: ["cursor"],
+            },
+            raw: {
+              type: "boolean",
+              description: "Keep terminal escape codes and carriage-return redraws",
             },
             machine: machineOption,
+            json: jsonOption,
           },
           async run(input, ctx) {
             const hostId = await resolveHost(input.options.machine, ctx.threadId);
-            const { job, text, truncated } = await call(
+            const result = await call(
               "logs",
-              { id: input.positionals.id, maxBytes: input.options.bytes },
+              {
+                id: input.positionals.id,
+                maxBytes: input.options.bytes,
+                since: input.options.since ?? null,
+                raw: input.options.raw,
+              },
               hostId,
               ctx.signal,
             ).catch(notFound);
+            await acknowledge(result.job, ctx.threadId);
+            if (input.options.json) {
+              return { exitCode: 0, stdout: JSON.stringify(result, null, 2) };
+            }
+            const { job, text, truncated, cursor, skippedBytes } = result;
+            const before =
+              input.options.since === undefined
+                ? truncated
+                  ? `[… earlier output in ${job.logPath}]\n`
+                  : ""
+                : skippedBytes > 0
+                  ? `[… ${skippedBytes} bytes were rotated away before this read]\n`
+                  : "";
+            const more =
+              input.options.since !== undefined && truncated
+                ? " (more output is waiting)"
+                : job.state === "running"
+                  ? " (job still running)"
+                  : "";
             return {
               exitCode: 0,
-              stdout:
-                (truncated ? `[… earlier output in ${job.logPath}]\n` : "") +
-                text,
-              stderr: `${describe(job)}\n`,
+              stdout: before + text,
+              stderr: `${describe(job)}\nnext: --since ${cursor}${more}\n`,
             };
           },
         }),
@@ -551,15 +783,16 @@ export default async function plugin(bb: BbPluginApi) {
             ).catch(notFound);
             while (job.state === "running" && Date.now() < deadline) {
               if (ctx.signal?.aborted) break;
-              await new Promise((r) => setTimeout(r, 2000));
+              await new Promise((r) => setTimeout(r, 1000));
               job = await call("get", { id: job.id }, hostId, ctx.signal);
             }
             const { text } = await call(
               "logs",
-              { id: job.id, maxBytes: 4096 },
+              { id: job.id, maxBytes: 4096, since: null, raw: false },
               hostId,
               ctx.signal,
             );
+            await acknowledge(job, ctx.threadId);
             const exitCode =
               job.state === "running"
                 ? 124
@@ -595,6 +828,7 @@ export default async function plugin(bb: BbPluginApi) {
               input.options.timeout,
               hostId,
               ctx.signal,
+              ctx.threadId,
             );
           },
         }),
@@ -655,9 +889,36 @@ export default async function plugin(bb: BbPluginApi) {
         stop: cliCommand({
           summary: "Stop a job and every process it started",
           positionals: [{ name: "id", description: "Job id", required: true }],
-          options: { machine: machineOption },
+          options: {
+            force: {
+              type: "boolean",
+              description: "Stop a job that another thread started",
+            },
+            machine: machineOption,
+          },
           async run(input, ctx) {
             const hostId = await resolveHost(input.options.machine, ctx.threadId);
+            const current = await call(
+              "get",
+              { id: input.positionals.id },
+              hostId,
+              ctx.signal,
+            ).catch(notFound);
+            if (
+              !input.options.force &&
+              ctx.threadId &&
+              current.threadId &&
+              current.threadId !== ctx.threadId &&
+              current.state === "running"
+            ) {
+              throw new PluginCliError(
+                `job ${current.id} belongs to thread ${current.threadId}, not this one`,
+                {
+                  code: "foreign_job",
+                  hint: "Ask the user first; add --force to stop it anyway.",
+                },
+              );
+            }
             const job = await call(
               "stop",
               { id: input.positionals.id },

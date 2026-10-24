@@ -23,11 +23,12 @@ log file.
 | `bb jobs start --name api --ready-url http://localhost:3000/health -- 'npm start'` | Start a server and return when it answers 2xx (`--ready-log '<regex>'` waits for a log line instead; `--ready-timeout`, default 60s, max 10m). Exit 0 ready, 1 the job ended, 124 not ready yet. |
 | `bb jobs ready <id> --url <url>` / `--log <regex>` | Re-check readiness of a running job. |
 | `bb jobs start --notify -- <command>` | Post the result and last output to this thread when the job ends (`--notify-thread <id>` for another thread). |
-| `bb jobs list [--running]` | Jobs on this machine, newest first. |
+| `bb jobs list [--running] [--all]` | This thread's jobs, newest first (`--all`: every thread's jobs on the machine). |
 | `bb jobs status <id>` | State, exit code, command and log path. |
-| `bb jobs logs <id> [--bytes N]` | End of the job's combined stdout/stderr (default 16 KiB). |
+| `bb jobs logs <id> [--bytes N]` | End of the job's combined stdout/stderr (default 16 KiB), without colour codes (`--raw` keeps them). |
+| `bb jobs logs <id> --since <N>` | Only output written after cursor N, in whole lines. Every `logs` call prints `next: --since N` on stderr. |
 | `bb jobs wait <id> [--timeout 5m]` | Block until the job ends (max 10m per call); exit code mirrors the job, 124 if still running. |
-| `bb jobs stop <id>` | SIGTERM the whole process tree, SIGKILL after 15 s. |
+| `bb jobs stop <id>` | SIGTERM the whole process tree, SIGKILL after 15 s. Refuses another thread's running job unless `--force`. |
 | `bb jobs prune --older-than 7d` | Move finished jobs to the archive (`--delete` to free disk). Only when the user asks to clean up. |
 
 All commands accept `--machine <id|name>` to target another machine and
@@ -54,6 +55,16 @@ All commands accept `--machine <id|name>` to target another machine and
   `BB_THREAD_STORAGE`; write job artifacts there.
 - If `start` prints a linger warning, tell the user: the job dies when they
   log out until they run the printed `loginctl enable-linger` command.
+- To follow a long job, use `bb jobs logs <id> --since <N>` with the cursor
+  from the previous call instead of re-reading the whole tail.
+- Do not stop or prune jobs that another thread started unless the user asks;
+  `list` shows only this thread's jobs unless `--all`.
+- When you read a finished job's result yourself (`wait`, `status`, `logs`,
+  `ready`), its `--notify` message is cancelled; several jobs that end
+  together arrive as one message.
+- If the user views bb remotely, a server on `localhost` is not reachable for
+  them: after it is ready, run `bb connect expose <port>` and give them the
+  URL it prints.
 - For a server, start it with `--ready-url` (or `--ready-log`) and say it is up
   only after exit 0. On exit 124 read `bb jobs logs <id>` before retrying
   `bb jobs ready`. `bb jobs stop <id>` when it is no longer needed.
