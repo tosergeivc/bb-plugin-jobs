@@ -200,6 +200,14 @@ for (;;) {
     if (waitpid($pid, POSIX::WNOHANG()) == $pid) {
       $code = POSIX::WIFEXITED($?) ? POSIX::WEXITSTATUS($?) : 128 + POSIX::WTERMSIG($?);
       $code = 124 if $timedout;
+      # Everything the command wrote before exiting is already in the pipe:
+      # log it before the exit line. Do not wait for leftover children.
+      while (!$eof) {
+        my $ready = select(my $rout = $rin, undef, undef, 0);
+        last unless $ready > 0;
+        my $got = sysread($r, my $buf, 65536);
+        if ($got) { put($buf) } else { $eof = 1 }
+      }
       finish($code);
     } elsif ($deadline && !$timedout && time() >= $deadline) {
       $timedout = 1;

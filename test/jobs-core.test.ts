@@ -222,7 +222,7 @@ for (const forceDetached of [false, true]) {
       const server = await jobs.start({
         ...base,
         name: "srv",
-        command: `sleep 1; echo "listening on ${port}"; exec python3 -m http.server ${port} --bind 127.0.0.1`,
+        command: `sleep 1; echo "listening on ${port}"; exec node -e "require('http').createServer((q, s) => s.end('ok')).listen(${port}, '127.0.0.1')"`,
       });
       const byUrl = await jobs.ready(server.id, { url: `http://127.0.0.1:${port}/`, logPattern: null }, 20000);
       if (byUrl.outcome !== "ready") {
@@ -365,6 +365,21 @@ for (const forceDetached of [false, true]) {
       assert.ok(ids.includes(mine.id));
       assert.ok(!ids.includes(other.id));
       assert.ok((await jobs.list(500)).some((j) => j.id === other.id));
+    });
+
+    it("writes [jobs] exited after all of the command's output", async () => {
+      for (let round = 0; round < 5; round++) {
+        const job = await jobs.start({
+          ...base,
+          name: "burst",
+          command: 'head -c 400000 /dev/zero | tr "\\0" x | fold -w 100; echo; echo LAST-LINE; exit 0',
+          logMaxBytes: 0,
+        });
+        await until(() => jobs.get(job.id), (j) => j.state !== "running");
+        const lines = readFileSync(job.logPath, "utf8").trimEnd().split("\n");
+        assert.match(lines.at(-1)!, /^\[jobs\] exited 0 /, `round ${round}: last lines ${JSON.stringify(lines.slice(-3))}`);
+        assert.equal(lines.at(-2), "LAST-LINE", `round ${round}`);
+      }
     });
 
     it("lists newest first", async () => {
