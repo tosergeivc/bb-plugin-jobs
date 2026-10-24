@@ -27,6 +27,7 @@ export const jobSchema = z.object({
   createdAt: z.string(),
   finishedAt: z.string().nullable(),
   timeoutSec: z.number().int().nullable(),
+  logMaxBytes: z.number().int().nullable(),
   threadId: z.string().nullable(),
   logPath: z.string(),
 });
@@ -41,6 +42,7 @@ export const hostContract = defineRpcContract({
         cwd: z.string().min(1),
         env: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string()),
         timeoutSec: z.number().int().positive().nullable(),
+        logMaxBytes: z.number().int().min(0),
         threadId: z.string().nullable(),
       })
       .strict(),
@@ -65,5 +67,38 @@ export const hostContract = defineRpcContract({
   stop: {
     input: z.object({ id: jobId }).strict(),
     output: jobSchema,
+  },
+  ready: {
+    input: z
+      .object({
+        id: jobId,
+        url: z.string().url().nullable(),
+        logPattern: z.string().min(1).max(1000).nullable(),
+        timeoutMs: z.number().int().min(1000).max(10 * 60 * 1000),
+      })
+      .strict(),
+    output: z
+      .object({
+        outcome: z.enum(["ready", "exited", "timeout"]),
+        waitedMs: z.number().int(),
+        detail: z.string(),
+        job: jobSchema,
+      })
+      .strict(),
+  },
+  prune: {
+    input: z
+      .object({
+        olderThanMs: z.number().int().min(0),
+        delete: z.boolean(),
+        dryRun: z.boolean(),
+      })
+      .strict(),
+    output: z
+      .object({
+        pruned: z.array(z.object({ id: z.string(), bytes: z.number() })),
+        archiveDir: z.string(),
+      })
+      .strict(),
   },
 });

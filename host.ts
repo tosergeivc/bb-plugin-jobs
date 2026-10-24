@@ -21,5 +21,9 @@ export default experimental_defineHostEntry({
     logs: ({ id, maxBytes }, ctx) =>
       jobs(ctx.experimental_paths.dataDir).logs(id, maxBytes),
     stop: ({ id }, ctx) => jobs(ctx.experimental_paths.dataDir).stop(id),
+    ready: ({ id, url, logPattern, timeoutMs }, ctx) =>
+      jobs(ctx.experimental_paths.dataDir).ready(id, { url, logPattern }, timeoutMs),
+    prune: ({ olderThanMs, delete: remove, dryRun }, ctx) =>
+      jobs(ctx.experimental_paths.dataDir).prune(olderThanMs, { remove, dryRun }),
   },
 });

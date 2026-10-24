@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-jobs",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "bb plugin: run servers, deploys and long commands as durable background jobs that survive the end of an agent turn and bb restarts.",
   "license": "MIT",
   "type": "module",

@@ -14,6 +14,7 @@ import { shellQuote } from "./jobs-core.js";
 
 const LOG_DEFAULT_BYTES = 16 * 1024;
 const LOG_MAX_BYTES = 512 * 1024;
+const READY_MAX_MS = 10 * 60 * 1000;
 
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -70,8 +71,82 @@ export default async function plugin(bb: BbPluginApi) {
     input: Parameters<typeof host.call<M>>[1],
     hostId: string,
     signal?: AbortSignal,
+    timeoutMs = 60_000,
   ) {
-    return host.call(method, input, { hostId, signal, timeoutMs: 60_000 });
+    return host.call(method, input, { hostId, signal, timeoutMs });
+  }
+
+  const readyOptions = {
+    "ready-url": {
+      type: "string",
+      description:
+        "Ready when this URL answers 2xx (checked on the job's machine, so localhost works)",
+    },
+    "ready-log": {
+      type: "string",
+      description: "Ready when the log has a line matching this regex",
+    },
+    "ready-timeout": {
+      type: "duration",
+      defaultUnit: "s",
+      min: 1000,
+      max: READY_MAX_MS,
+      default: 60_000,
+      description: "How long to wait for ready (max 10m; the job keeps running). Exit 124",
+    },
+  } as const;
+
+  function readyCheck(options: {
+    "ready-url"?: string;
+    "ready-log"?: string;
+  }): { url: string | null; logPattern: string | null } | null {
+    const url = options["ready-url"] ?? null;
+    const logPattern = options["ready-log"] ?? null;
+    if (url === null && logPattern === null) return null;
+    if (url !== null && !/^https?:\/\//.test(url)) {
+      throw new PluginCliError(`--ready-url must start with http:// or https://: ${url}`, {
+        code: "invalid_url",
+      });
+    }
+    if (logPattern !== null) {
+      try {
+        new RegExp(logPattern, "m");
+      } catch (error) {
+        throw new PluginCliError(`bad --ready-log regex: ${(error as Error).message}`, {
+          code: "invalid_regex",
+        });
+      }
+    }
+    return { url, logPattern };
+  }
+
+  async function waitReady(
+    id: string,
+    check: { url: string | null; logPattern: string | null },
+    timeoutMs: number,
+    hostId: string,
+    signal?: AbortSignal,
+  ) {
+    const result = await call(
+      "ready",
+      { id, ...check, timeoutMs },
+      hostId,
+      signal,
+      timeoutMs + 30_000,
+    );
+    const { text } = await call("logs", { id, maxBytes: 4096 }, hostId, signal);
+    const exitCode =
+      result.outcome === "ready" ? 0 : result.outcome === "timeout" ? 124 : 1;
+    const verdict =
+      result.outcome === "ready"
+        ? `READY after ${(result.waitedMs / 1000).toFixed(1)}s: ${result.detail}`
+        : result.outcome === "timeout"
+          ? `NOT READY after ${(result.waitedMs / 1000).toFixed(1)}s (job still running): ${result.detail}`
+          : `FAILED: ${result.detail}`;
+    return {
+      exitCode,
+      stdout: `${describe(result.job)}\n${verdict}\n--- last output ---\n${text}`,
+    };
   }
 
   bb.cli.register(
@@ -108,10 +183,20 @@ export default async function plugin(bb: BbPluginApi) {
               description:
                 "Kill the job's process group after this long; exit 124 (needs perl). Default: none",
             },
+            "log-max": {
+              type: "integer",
+              min: 0,
+              max: 4096,
+              default: 50,
+              description:
+                "Rotate output.log to output.log.1 past this many MiB, so at most twice this is kept; 0 = no limit",
+            },
+            ...readyOptions,
             machine: machineOption,
             json: jsonOption,
           },
           async run(input, ctx) {
+            const ready = readyCheck(input.options);
             const command =
               input.passthrough.length === 1
                 ? input.passthrough[0]!
@@ -155,11 +240,26 @@ export default async function plugin(bb: BbPluginApi) {
                   input.options.timeout === undefined
                     ? null
                     : Math.ceil(input.options.timeout / 1000),
+                logMaxBytes: input.options["log-max"] * 1024 * 1024,
                 threadId: ctx.threadId ?? null,
               },
               hostId,
               ctx.signal,
             );
+            if (ready) {
+              const result = await waitReady(
+                job.id,
+                ready,
+                input.options["ready-timeout"],
+                hostId,
+                ctx.signal,
+              );
+              if (input.options.json) {
+                const now = await call("get", { id: job.id }, hostId, ctx.signal);
+                return { exitCode: result.exitCode, stdout: JSON.stringify(now, null, 2) };
+              }
+              return result;
+            }
             // Give fast failures (typo, missing file) a moment to surface.
             await new Promise((r) => setTimeout(r, 1500));
             const { job: now, text } = await call(
@@ -314,6 +414,86 @@ export default async function plugin(bb: BbPluginApi) {
             return {
               exitCode,
               stdout: `${describe(job)}\n--- last output ---\n${text}`,
+            };
+          },
+        }),
+        ready: cliCommand({
+          summary: "Wait until a running job is ready (URL answers or log line appears)",
+          positionals: [{ name: "id", description: "Job id", required: true }],
+          options: {
+            url: { ...readyOptions["ready-url"], aliases: ["ready-url"] },
+            log: { ...readyOptions["ready-log"], aliases: ["ready-log"] },
+            timeout: { ...readyOptions["ready-timeout"], aliases: ["ready-timeout"] },
+            machine: machineOption,
+          },
+          constraints: [{ kind: "at-least-one", options: ["url", "log"] }],
+          async run(input, ctx) {
+            const check = readyCheck({
+              "ready-url": input.options.url,
+              "ready-log": input.options.log,
+            })!;
+            const hostId = await resolveHost(input.options.machine, ctx.threadId);
+            await call("get", { id: input.positionals.id }, hostId, ctx.signal).catch(notFound);
+            return waitReady(
+              input.positionals.id,
+              check,
+              input.options.timeout,
+              hostId,
+              ctx.signal,
+            );
+          },
+        }),
+        prune: cliCommand({
+          summary: "Archive (or delete) finished jobs older than a given age",
+          description:
+            "Moves job directories of finished jobs into the plugin's archive directory. Running jobs are never touched. Use --delete to free the disk space instead.",
+          options: {
+            "older-than": {
+              type: "duration",
+              defaultUnit: "d",
+              min: 0,
+              required: true,
+              description: "Only jobs that ended at least this long ago (e.g. 7d, 12h)",
+            },
+            delete: {
+              type: "boolean",
+              description: "Delete instead of moving to the archive",
+            },
+            "dry-run": {
+              type: "boolean",
+              description: "Only list what would be pruned",
+            },
+            machine: machineOption,
+            json: jsonOption,
+          },
+          async run(input, ctx) {
+            const hostId = await resolveHost(input.options.machine, ctx.threadId);
+            const result = await call(
+              "prune",
+              {
+                olderThanMs: input.options["older-than"],
+                delete: input.options.delete,
+                dryRun: input.options["dry-run"],
+              },
+              hostId,
+              ctx.signal,
+            );
+            if (input.options.json) {
+              return { exitCode: 0, stdout: JSON.stringify(result, null, 2) };
+            }
+            const total = result.pruned.reduce((n, p) => n + p.bytes, 0);
+            const verb = input.options["dry-run"]
+              ? "Would prune"
+              : input.options.delete
+                ? "Deleted"
+                : `Archived to ${result.archiveDir}:`;
+            return {
+              exitCode: 0,
+              stdout: result.pruned.length
+                ? `${verb} ${result.pruned.length} job(s), ${(total / 1024 / 1024).toFixed(1)} MiB\n` +
+                  result.pruned.map((p) => `  ${p.id}`).join("\n") +
+                  "\n"
+                : "Nothing to prune.\n",
             };
           },
         }),
