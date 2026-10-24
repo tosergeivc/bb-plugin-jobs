@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { JobManager, cleanTerminalText } from "../jobs-core.ts";
+import { JobManager, cleanTerminalText, isLaunchLine } from "../jobs-core.ts";
 
 function grepDir(dir: string, needle: string): string[] {
   return readdirSync(dir).filter((f) => readFileSync(path.join(dir, f), "utf8").includes(needle));
@@ -18,6 +18,19 @@ function freePort(): Promise<number> {
       srv.close(() => resolve(port));
     });
   });
+}
+
+/** Processes that mention a job directory, for failure messages. */
+function psLines(dir: string): string {
+  try {
+    return execFileSync("ps", ["-A", "-ww", "-o", "pid=,ppid=,pgid=,command="])
+      .toString()
+      .split("\n")
+      .filter((l) => l.includes(dir))
+      .join(" | ");
+  } catch (error) {
+    return String(error);
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -40,6 +53,31 @@ function alive(pattern: string): boolean {
     return false;
   }
 }
+
+describe("isLaunchLine", () => {
+  const dir = "/data/jobs/srv-1a2b3c";
+  it("accepts the job's own launch lines under any interpreter path or version", () => {
+    for (const line of [
+      `perl ${dir}/exec.pl ${dir} 0 0 bash ${dir}/command.sh`,
+      `/usr/bin/perl5.34 ${dir}/exec.pl ${dir} 52428800 0 bash ${dir}/command.sh`,
+      `/bin/bash ${dir}/runner.sh ${dir}`,
+      `bash ${dir}/runner.sh ${dir}`,
+      `bash ${dir}/command.sh`,
+      `/opt/homebrew/bin/bash ${dir}/command.sh`,
+    ]) assert.ok(isLaunchLine(line, dir), line);
+  });
+  it("rejects strangers that only mention the job directory", () => {
+    for (const line of [
+      `tail -f ${dir}/output.log`,
+      `cat ${dir}/command.sh`,
+      `bash -c cat ${dir}/command.sh`,
+      `vim ${dir}/exec.pl`,
+      `perl ${dir}/exec.pl.bak`,
+      `bash /data/jobs/srv-1a2b3cX/command.sh`,
+      `perl /data/jobs/srv-1a2b3c-other/exec.pl x`,
+    ]) assert.equal(isLaunchLine(line, dir), false, line);
+  });
+});
 
 describe("cleanTerminalText", () => {
   it("drops colour and OSC codes and keeps the last redraw of a line", () => {
@@ -174,9 +212,9 @@ for (const forceDetached of [false, true]) {
       const kept = statSync(job.logPath).size + statSync(path.join(dir, "output.log.1")).size;
       assert.ok(kept < 2 * (20000 + 65536), `kept ${kept} bytes`);
       assert.ok(kept < 600 * 160, "older output was dropped");
-      const { text } = await jobs.logs(job.id, 4096);
+      const { text, job: seen } = await jobs.logs(job.id, 4096);
       assert.match(text, /line 0600 /);
-      assert.match(text, /exited 0/);
+      assert.match(text, /exited 0/, `state=${seen.state} exit=${seen.exitCode}; ps: ${psLines(dir)}`);
     });
 
     it("ready: URL answers, log line appears, job exits early, or times out", async () => {
@@ -187,7 +225,10 @@ for (const forceDetached of [false, true]) {
         command: `sleep 1; echo "listening on ${port}"; exec python3 -m http.server ${port} --bind 127.0.0.1`,
       });
       const byUrl = await jobs.ready(server.id, { url: `http://127.0.0.1:${port}/`, logPattern: null }, 20000);
-      assert.equal(byUrl.outcome, "ready", byUrl.detail);
+      if (byUrl.outcome !== "ready") {
+        const { text } = await jobs.logs(server.id, 4096);
+        assert.fail(`ready=${byUrl.outcome} (${byUrl.detail}); state=${byUrl.job.state}; log:\n${text}; ps: ${psLines(path.dirname(server.logPath))}`);
+      }
       assert.ok(byUrl.waitedMs >= 500, "not ready before the server started");
       const byLog = await jobs.ready(server.id, { url: null, logPattern: `listening on \\d+` }, 5000);
       assert.equal(byLog.outcome, "ready", byLog.detail);

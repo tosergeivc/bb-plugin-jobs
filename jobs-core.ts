@@ -740,6 +740,20 @@ export class JobManager {
 }
 
 /**
+ * Is this `ps` command line one of the job's own processes? The interpreter
+ * may show up under its full or versioned path (macOS can re-execute
+ * /usr/bin/perl as perl5.x); the job's own files must match exactly.
+ */
+export function isLaunchLine(command: string, dir: string): boolean {
+  const escaped = dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return [
+    new RegExp(`^\\S*bash ${escaped}/runner\\.sh ${escaped}$`),
+    new RegExp(`^\\S*bash ${escaped}/command\\.sh$`),
+    new RegExp(`^\\S*perl[\\d.]* ${escaped}/exec\\.pl `),
+  ].some((pattern) => pattern.test(command));
+}
+
+/**
  * PIDs that belong to the job: its own launch lines and everything descending
  * from them; plus members of the command's process group that started no
  * earlier than the job, but only while that group's leader is the job's own
@@ -750,11 +764,7 @@ async function ownedProcesses(
   dir: string,
   meta: Pick<JobMeta, "createdAt">,
 ): Promise<Set<number>> {
-  const launchLines = [
-    `/bin/bash ${dir}/runner.sh ${dir}`,
-    `bash ${dir}/command.sh`,
-  ];
-  const execPrefix = `perl ${dir}/exec.pl `;
+
   const pgidRaw = await readFile(path.join(dir, "pgid"), "utf8").catch(() => "");
   const commandGroup = Number.parseInt(pgidRaw, 10);
   // lstart has 1 s resolution; allow for it.
@@ -783,7 +793,7 @@ async function ownedProcesses(
     if (pid === process.pid) continue;
     seen.add(pid);
     children.set(ppid, [...(children.get(ppid) ?? []), pid]);
-    if (launchLines.includes(command) || command.startsWith(execPrefix)) {
+    if (isLaunchLine(command, dir)) {
       owned.add(pid);
     } else if (
       Number.isFinite(commandGroup) &&
