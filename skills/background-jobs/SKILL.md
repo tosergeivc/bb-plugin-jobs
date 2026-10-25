@@ -44,9 +44,15 @@ All commands accept `--machine <id|name>` to target another machine and
   (e.g. `--key deploy:<commit>`): if your first `start` answer was lost, the
   same command with the same key returns the existing job instead of a second
   run. A different command with a used key fails with `key_conflict` (pick a
-  new key). `key_busy` or `key_unknown` means an earlier start with that key
-  may still be running or stopped half-way: tell the user, check
-  `bb jobs list --all`, and only after that run `bb jobs release-key <key>`.
+  new key). `key_busy` means another start with that key is still running:
+  wait and repeat the same command. `key_unknown` means an earlier start
+  stopped half-way and may have run: tell the user, check
+  `bb jobs list --all` (a half-way start shows as `incomplete`; `bb jobs
+  status <id>`, and on Linux `systemctl --user status bbjob-<id>`), and only
+  after that run `bb jobs release-key <key>`.
+- A failed start with `start_refused` ran nothing: fix the input and retry.
+  `start_unknown` means the answer was lost and the job may be running: repeat
+  the same command with the same `--key`, never with a new key.
 - Secrets: put them in a chmod-600 `KEY=VALUE` file on the job's machine and
   pass `--env-file /absolute/path` (a file other users can read is refused);
   never put a secret in the command or in `--env`.

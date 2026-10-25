@@ -521,3 +521,194 @@ for (const forceDetached of [false, true]) {
     });
   });
 }
+
+describe("--key recovery (0.5.3)", () => {
+  const base = { cwd: "/tmp", env: {}, timeoutSec: null, threadId: null, name: "rec", command: "sleep 20" };
+  const fresh = (opts: ConstructorParameters<typeof JobManager>[1] = {}) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bbjobs-rec-"));
+    return { root, jobs: new JobManager(root, { forceDetached: true, ...opts }) };
+  };
+  const gens = (root: string, key: string) => path.join(root, "claims", keyHash(key));
+  const deadPid = () => {
+    const child = spawn("true");
+    return new Promise<number>((resolve) => child.on("exit", () => resolve(child.pid!)));
+  };
+
+  it("an unreadable claim gives key_unknown, and release-key frees it without reading it", async () => {
+    const { root, jobs } = fresh();
+    mkdirSync(gens(root, "torn"), { recursive: true });
+    writeFileSync(path.join(gens(root, "torn"), "00000001"), '{"state":"pen');
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "torn" }), /^Error: key_unknown: .*cannot be read/);
+    // The same for a torn 0.5.2 claim file.
+    mkdirSync(path.join(root, "keys"), { recursive: true });
+    writeFileSync(path.join(root, "keys", keyHash("torn-old")), "{");
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "torn-old" }), /key_unknown/);
+    for (const key of ["torn", "torn-old"]) {
+      const released = await jobs.releaseKey(key);
+      assert.deepEqual([released.released, released.state], [true, "unreadable"]);
+      const job = await jobs.startWithChecks({ ...base, key });
+      assert.equal(job.reused, false);
+      await jobs.stop(job.id);
+    }
+    assert.ok(existsSync(path.join(gens(root, "torn"), "00000001")), "old claim kept");
+  });
+
+  it("release-key refuses while the key's job exists, unless forced", async () => {
+    const { jobs } = fresh();
+    const job = await jobs.startWithChecks({ ...base, key: "live" });
+    await assert.rejects(jobs.releaseKey("live"), /key_in_use: .*running/);
+    assert.equal((await jobs.startWithChecks({ ...base, key: "live" })).id, job.id, "still bound");
+    assert.equal((await jobs.releaseKey("live", { force: true })).released, true);
+    const second = await jobs.startWithChecks({ ...base, key: "live" });
+    assert.notEqual(second.id, job.id);
+    assert.deepEqual(await jobs.releaseKey("nothing"), { released: false, state: "none", backup: null });
+    for (const j of await jobs.list(50)) await jobs.stop(j.id);
+  });
+
+  it("a launch that stopped half-way is listed as incomplete, keeps its key and is preferred over nothing", async () => {
+    const { root, jobs } = fresh();
+    const job = await jobs.startWithChecks({ ...base, key: "half", command: "true" });
+    await until(() => jobs.get(job.id), (j) => j.state !== "running");
+    // Make it look like a worker that died between launch and confirmation.
+    const dir = path.dirname(job.logPath);
+    rmSync(path.join(dir, "exit"));
+    writeFileSync(path.join(dir, "launch"), "launching\n");
+    writeFileSync(path.join(gens(root, "half"), "00000002"), JSON.stringify({ state: "pending", pid: await deadPid(), jobId: null, fingerprint: null }));
+    assert.equal((await jobs.get(job.id)).state, "incomplete");
+    assert.deepEqual((await jobs.list(50)).map((j) => [j.id, j.state]), [[job.id, "incomplete"]]);
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "half", command: "true" }), new RegExp(`key_unknown: .*job ${job.id}.*bb jobs status ${job.id}`));
+    assert.deepEqual((await jobs.prune(0, { remove: false, dryRun: false })).pruned, [], "prune keeps a keyed incomplete job");
+    await jobs.releaseKey("half");
+    assert.ok(!existsSync(path.join(dir, "key")), "marker renamed on release");
+    // A stale half-way directory does not hide a later complete job.
+    const next = await jobs.startWithChecks({ ...base, key: "half", command: "true" });
+    writeFileSync(path.join(dir, "key"), keyHash("half"));
+    writeFileSync(path.join(gens(root, "half"), "00000009"), JSON.stringify({ state: "pending", pid: await deadPid(), jobId: null, fingerprint: null }));
+    const adopted = await jobs.startWithChecks({ ...base, key: "half", command: "true" });
+    assert.deepEqual([adopted.id, adopted.reused], [next.id, true]);
+  });
+
+  it("a launch that fails before any process exists frees the key and is not listed", async () => {
+    const { root, jobs } = fresh({ shell: "/nonexistent/bash" });
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "nolaunch" }), /^Error: start_refused: could not start bash/);
+    assert.deepEqual(await jobs.list(50), []);
+    const ok = new JobManager(root, { forceDetached: true });
+    const job = await ok.startWithChecks({ ...base, key: "nolaunch", command: "true" });
+    assert.equal(job.reused, false, "the corrected request starts");
+  });
+
+  it("the request fingerprint ignores a trailing slash; 0.5.0 claims compare the command", async () => {
+    const { root, jobs } = fresh();
+    const a = await jobs.startWithChecks({ ...base, key: "slash", cwd: "/tmp/", command: "true" });
+    assert.equal((await jobs.startWithChecks({ ...base, key: "slash", cwd: "/tmp", command: "true" })).id, a.id);
+    // 0.5.0/0.5.1: the claim file held the job id; meta.json had no fingerprint.
+    const legacy = await jobs.start({ ...base, command: "echo old" });
+    const metaFile = path.join(path.dirname(legacy.logPath), "meta.json");
+    const meta = JSON.parse(readFileSync(metaFile, "utf8"));
+    delete meta.keyFingerprint;
+    writeFileSync(metaFile, JSON.stringify(meta));
+    mkdirSync(path.join(root, "keys"), { recursive: true });
+    writeFileSync(path.join(root, "keys", keyHash("old")), legacy.id);
+    assert.equal((await jobs.startWithChecks({ ...base, key: "old", command: "echo old" })).id, legacy.id);
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "old", command: "echo new" }), /key_conflict/);
+  });
+
+  it("a pending claim whose PID now belongs to another process run is taken as dead", async () => {
+    const { root, jobs } = fresh();
+    mkdirSync(gens(root, "reused-pid"), { recursive: true });
+    // Our own (live) PID, but a start time from another run of it.
+    writeFileSync(path.join(gens(root, "reused-pid"), "00000001"), JSON.stringify({ state: "pending", pid: process.ppid, pidStart: "1", jobId: null, fingerprint: null }));
+    assert.equal((await jobs.startWithChecks({ ...base, key: "reused-pid", command: "true" })).reused, false);
+    // Same PID and same start time: busy.
+    const owner = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    owner.unref();
+    await sleep(200);
+    const token = process.platform === "linux"
+      ? readFileSync(`/proc/${owner.pid}/stat`, "utf8").split(") ")[1]!.split(" ")[19]!
+      : execFileSync("ps", ["-o", "lstart=", "-p", String(owner.pid)], { env: { ...process.env, LC_ALL: "C" } }).toString().trim();
+    mkdirSync(gens(root, "owned"), { recursive: true });
+    writeFileSync(path.join(gens(root, "owned"), "00000001"), JSON.stringify({ state: "pending", pid: owner.pid, pidStart: token, jobId: null, fingerprint: null }));
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "owned" }), /key_busy/);
+    process.kill(owner.pid!, "SIGKILL");
+  });
+
+  const startToken = (pid: number) =>
+    process.platform === "linux"
+      ? readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[19]!
+      : execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...process.env, LC_ALL: "C" } }).toString().trim();
+  const pending = (root: string, key: string, gen: string, pid: number, pidStart: string | null = null) => {
+    mkdirSync(gens(root, key), { recursive: true });
+    writeFileSync(path.join(gens(root, key), gen), JSON.stringify({ state: "pending", pid, pidStart, jobId: null, fingerprint: null }));
+  };
+
+  it("release-key without --force refuses a start in progress and a started job of a dead owner", async () => {
+    const { root, jobs } = fresh();
+    const owner = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    owner.unref();
+    await sleep(200);
+    pending(root, "inflight", "00000001", owner.pid!, startToken(owner.pid!));
+    await assert.rejects(jobs.releaseKey("inflight"), /key_in_use: .*start in progress/);
+    process.kill(owner.pid!, "SIGKILL");
+    // The owner died after launching: its job runs, the claim stays pending.
+    const job = await jobs.start({ ...base, keyHash: keyHash("orphan") });
+    pending(root, "orphan", "00000001", await deadPid());
+    await assert.rejects(jobs.releaseKey("orphan"), new RegExp(`key_in_use: .*started job ${job.id}`));
+    const retry = await jobs.startWithChecks({ ...base, key: "orphan" });
+    assert.deepEqual([retry.id, retry.reused], [job.id, true], "a plain retry adopts it");
+    await jobs.stop(job.id);
+  });
+
+  it("an error after the launch keeps the key bound: the retry returns the job", async () => {
+    class Flaky extends JobManager {
+      fail = true;
+      override async get(id: string) {
+        if (this.fail) {
+          this.fail = false;
+          throw new Error("EIO: simulated read failure");
+        }
+        return super.get(id);
+      }
+    }
+    const root = mkdtempSync(path.join(tmpdir(), "bbjobs-rec-"));
+    const jobs = new Flaky(root, { forceDetached: true });
+    await assert.rejects(jobs.startWithChecks({ ...base, key: "flaky" }), /EIO/);
+    const retry = await jobs.startWithChecks({ ...base, key: "flaky" });
+    assert.equal(retry.reused, true);
+    assert.equal((await jobs.list(50)).length, 1, "one job");
+    await jobs.stop(retry.id);
+  });
+
+  it("after release-key --force no old job is adopted for the key", async () => {
+    const { root, jobs } = fresh();
+    const old = await jobs.startWithChecks({ ...base, key: "forced", command: "true" });
+    await until(() => jobs.get(old.id), (j) => j.state !== "running");
+    await jobs.releaseKey("forced", { force: true });
+    assert.ok(!existsSync(path.join(path.dirname(old.logPath), "key")), "old marker renamed");
+    // A new start whose process died after launching.
+    const next = await jobs.start({ ...base, keyHash: keyHash("forced") });
+    pending(root, "forced", "00000003", await deadPid());
+    const again = await jobs.startWithChecks({ ...base, key: "forced" });
+    assert.notEqual(again.id, old.id);
+    assert.deepEqual([again.id, again.reused], [next.id, true]);
+    await jobs.stop(next.id);
+  });
+
+  it("a start that died before writing meta.json never launched: the key is free", async () => {
+    const { root, jobs } = fresh();
+    const dir = path.join(root, "jobs", "pre-000000");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "launch"), "launching\n");
+    writeFileSync(path.join(dir, "key"), keyHash("pre"));
+    pending(root, "pre", "00000001", await deadPid());
+    const job = await jobs.startWithChecks({ ...base, key: "pre", command: "true" });
+    assert.equal(job.reused, false);
+  });
+
+  it("zero limits are refused before anything is created", async () => {
+    const { jobs } = fresh();
+    await assert.rejects(jobs.start({ ...base, cpuQuota: "0%" }), /start_refused: bad --cpu-quota 0%/);
+    await assert.rejects(jobs.start({ ...base, memoryMax: "0" }), /start_refused: bad --memory-max 0/);
+    await assert.rejects(jobs.start({ ...base, memoryMax: "0%" }), /bad --memory-max/);
+    await assert.rejects(jobs.start({ ...base, memoryMax: "101%" }), /bad --memory-max/);
+  });
+});

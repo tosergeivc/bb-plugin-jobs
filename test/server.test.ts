@@ -9,6 +9,7 @@ import {
   createFakePluginHost,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
+import { requestFingerprint } from "../jobs-core.ts";
 import plugin from "../server.ts";
 
 const HOST = "host_test";
@@ -51,6 +52,9 @@ function setup() {
   const sends: { threadId: string; text: string; mode: string }[] = [];
   const queued = new Map<string, { id: string; updatedAt: number; text: string }[]>();
   let sendBehaviour: "ok" | "fail" = "ok";
+  // What the machine does with the next start: run it, refuse it, or never answer.
+  let startFault: "none" | "refuse" | "timeout" = "none";
+  const fingerprints = new Map<string, string>();
   let counter = 0;
 
   const publicJob = (job: FakeJob) => {
@@ -116,15 +120,22 @@ function setup() {
             timeoutSec: null, logMaxBytes: Number(input.logMaxBytes), threadId: (input.threadId as string) ?? null,
             logPath: `/data/jobs/${id}/output.log`, output: "",
           };
+          if (startFault === "refuse") throw new Error("start_refused: working directory does not exist: /gone");
+          if (startFault === "timeout") throw new Error("host RPC start timed out after 60000 ms");
+          // The same fingerprint as the real machine side.
+          const fingerprint = requestFingerprint(input as unknown as Parameters<typeof requestFingerprint>[0]);
           if (input.key && keys.has(String(input.key))) {
             const existing = jobs.get(keys.get(String(input.key))!)!;
-            if (existing.command !== input.command) {
+            if (fingerprints.get(String(input.key)) !== fingerprint) {
               throw new Error(`key_conflict: --key ${String(input.key)} was used for a different request`);
             }
             return { ...publicJob(existing), warnings: [], reused: true };
           }
           jobs.set(id, job);
-          if (input.key) keys.set(String(input.key), id);
+          if (input.key) {
+            keys.set(String(input.key), id);
+            fingerprints.set(String(input.key), fingerprint);
+          }
           return { ...publicJob(job), warnings: [], reused: false };
         }
         case "get":
@@ -140,6 +151,9 @@ function setup() {
           return { job: publicJob(job), text: job.output, truncated: false, cursor: job.output.length, skippedBytes: 0 };
         }
         case "releaseKey":
+          if (keys.has(String(input.key)) && !input.force) {
+            throw new Error(`key_in_use: --key ${String(input.key)} belongs to job ${keys.get(String(input.key))} (running); add --force`);
+          }
           return keys.delete(String(input.key))
             ? { released: true, state: "done", backup: "/data/keys/x.bak" }
             : { released: false, state: "none", backup: null };
@@ -175,6 +189,7 @@ function setup() {
   return {
     bb, harness, jobs, threadStatus, sends, queued, end, start, pending,
     setSend: (b: "ok" | "fail") => { sendBehaviour = b; },
+    setStartFault: (f: "none" | "refuse" | "timeout") => { startFault = f; },
   };
 }
 
@@ -354,11 +369,32 @@ describe("bb jobs CLI", () => {
     const conflict = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "k1", "--json", "--", "false"], { threadId: THREAD });
     assert.equal(conflict.exitCode, 1);
     assert.equal(JSON.parse(conflict.stdout).error.code, "key_conflict");
-    const release = await t.harness.behavior.runCli(["release-key", "k1"], { threadId: THREAD });
+    // A different directory is a different request too.
+    const elsewhere = await t.harness.behavior.runCli(["start", "--cwd", "/var", "--key", "k1", "--json", "--", "true"], { threadId: THREAD });
+    assert.equal(JSON.parse(elsewhere.stdout).error.code, "key_conflict");
+    const refused = await t.harness.behavior.runCli(["release-key", "k1", "--json"], { threadId: THREAD });
+    assert.equal(refused.exitCode, 1);
+    assert.equal(JSON.parse(refused.stdout).error.code, "key_in_use");
+    const release = await t.harness.behavior.runCli(["release-key", "k1", "--force"], { threadId: THREAD });
     assert.match(release.stdout, /^Released --key k1/);
     const again = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "k1", "--", "false"], { threadId: THREAD });
     assert.equal(again.exitCode, 0, again.stderr);
     assert.equal(t.jobs.size, 2);
+  });
+
+  it("tells a refused start from one whose result is unknown", async () => {
+    const t = await boot();
+    t.setStartFault("refuse");
+    const refused = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--json", "--", "true"], { threadId: THREAD });
+    assert.deepEqual(JSON.parse(refused.stdout).error, { code: "start_refused", message: "working directory does not exist: /gone" });
+    t.setStartFault("timeout");
+    const unknown = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "u1", "--", "true"], { threadId: THREAD });
+    assert.equal(unknown.exitCode, 1);
+    const json = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "u1", "--json", "--", "true"], { threadId: THREAD });
+    const error = JSON.parse(json.stdout).error;
+    assert.equal(error.code, "start_unknown");
+    assert.match(error.message, /not confirmed: host RPC start timed out/);
+    assert.match(unknown.stderr + unknown.stdout, /same --key/);
   });
 
   it("rejects --notify outside a thread with a hint", async () => {

@@ -2,6 +2,7 @@
 // machine where the job must live). Both sides validate at the wire.
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { KEY_PATTERN } from "./jobs-core.js";
 
 export const JOB_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const jobId = z.string().regex(JOB_ID_PATTERN);
@@ -11,6 +12,8 @@ export const jobStateSchema = z.enum([
   "exited", // finished and recorded its exit code
   "stopped", // stopped through `bb jobs stop`
   "lost", // gone without an exit code (reboot, OOM, killed from outside)
+  "incomplete", // the start did not finish; unknown whether the command ran
+  "not-started", // the launch failed before any process existed
 ]);
 export type JobState = z.infer<typeof jobStateSchema>;
 
@@ -47,7 +50,7 @@ export const hostContract = defineRpcContract({
         // BB_THREAD_ID, BB_THREAD_STORAGE, ... for the job's environment.
         bbEnv: z.record(z.string().regex(/^BB_[A-Z_]+$/), z.string()),
         // Idempotency key: a repeated start returns the job of the first one.
-        key: z.string().regex(/^[\x21-\x7e]{1,200}$/).nullable(),
+        key: z.string().regex(KEY_PATTERN).nullable(),
         // Absolute path of a KEY=VALUE file on the job's machine.
         envFile: z.string().min(1).max(4096).nullable(),
         memoryMax: z.string().max(32).nullable(),
@@ -116,7 +119,9 @@ export const hostContract = defineRpcContract({
       .strict(),
   },
   releaseKey: {
-    input: z.object({ key: z.string().regex(/^[\x21-\x7e]{1,200}$/) }).strict(),
+    input: z
+      .object({ key: z.string().regex(KEY_PATTERN), force: z.boolean() })
+      .strict(),
     output: z
       .object({ released: z.boolean(), state: z.string(), backup: z.string().nullable() })
       .strict(),

@@ -32,6 +32,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   appendFile,
+  link,
   mkdir,
   open,
   readFile,
@@ -87,7 +88,7 @@ export function requestFingerprint(input: StartInput): string {
     .update(
       JSON.stringify({
         command: input.command,
-        cwd: input.cwd,
+        cwd: path.resolve(input.cwd),
         env,
         envFile: input.envFile ?? null,
         timeoutSec: input.timeoutSec ?? null,
@@ -100,26 +101,137 @@ export function requestFingerprint(input: StartInput): string {
     .digest("hex");
 }
 
+/**
+ * One step in a key's history. "pending": a start is under way in process
+ * `pid`; "done": it started `jobId`; "failed": it started nothing;
+ * "released": freed by release-key.
+ */
 type Claim = {
-  state: "pending" | "done";
+  state: "pending" | "done" | "failed" | "released";
   pid: number;
+  /** Start time of `pid` (see processStartToken); null for 0.5.x claims. */
+  pidStart: string | null;
   jobId: string | null;
   fingerprint: string | null;
 };
 
-async function readClaim(file: string): Promise<Claim | null> {
-  const raw = await readFile(file, "utf8").catch(() => null);
-  if (raw === null) return null;
+type Latest = { gen: number; claim: Claim | "corrupt" } | null;
+
+const GEN_PATTERN = /^\d{8}$/;
+// Compare-and-set rounds before giving up on a key that keeps changing.
+const CLAIM_ATTEMPTS = 20;
+const keepsChanging = (key: string) =>
+  new Error(`key_busy: --key ${key} keeps changing under concurrent starts; try again`);
+
+function parseClaim(raw: string): Claim | "corrupt" {
   const text = raw.trim();
-  if (!text) return { state: "pending", pid: -1, jobId: null, fingerprint: null };
-  if (!text.startsWith("{")) return { state: "done", pid: -1, jobId: text, fingerprint: null }; // 0.5.0/0.5.1
-  return JSON.parse(text) as Claim;
+  if (!text) return "corrupt";
+  if (!text.startsWith("{")) {
+    // 0.5.0/0.5.1: the job id alone, written once the job had started.
+    return { state: "done", pid: -1, pidStart: null, jobId: text, fingerprint: null };
+  }
+  try {
+    const claim = JSON.parse(text) as Partial<Claim>;
+    if (!["pending", "done", "failed", "released"].includes(claim.state as string)) return "corrupt";
+    return {
+      state: claim.state!,
+      pid: typeof claim.pid === "number" ? claim.pid : -1,
+      pidStart: claim.pidStart ?? null,
+      jobId: claim.jobId ?? null,
+      fingerprint: claim.fingerprint ?? null,
+    };
+  } catch {
+    return "corrupt";
+  }
 }
 
-async function writeClaim(file: string, claim: Claim): Promise<void> {
-  const tmp = `${file}.tmp-${process.pid}`;
-  await writeFile(tmp, JSON.stringify(claim), { mode: 0o600 });
-  await rename(tmp, file);
+/**
+ * A key's claims live in <root>/claims/<sha256>/ as numbered generations.
+ * Every change creates the next number with link(), which fails if that
+ * number exists: of several processes acting on the same generation exactly
+ * one wins, and a file is never seen half-written. 0.5.x kept a single file
+ * <root>/keys/<sha256>; it counts as generation 0.
+ */
+class ClaimLog {
+  constructor(
+    private readonly dir: string,
+    private readonly legacyFile: string,
+  ) {}
+
+  async latest(): Promise<Latest> {
+    const gens = (await readdir(this.dir).catch(() => [] as string[]))
+      .filter((n) => GEN_PATTERN.test(n))
+      .sort();
+    const last = gens.at(-1);
+    if (last) {
+      const raw = await readFile(path.join(this.dir, last), "utf8").catch(() => "");
+      return { gen: Number(last), claim: parseClaim(raw) };
+    }
+    const legacy = await readFile(this.legacyFile, "utf8").catch(() => null);
+    return legacy === null ? null : { gen: 0, claim: parseClaim(legacy) };
+  }
+
+  /** Create generation `gen`; false if another process created it first. */
+  async create(gen: number, claim: Claim): Promise<boolean> {
+    await mkdir(this.dir, { recursive: true, mode: 0o700 });
+    const tmp = await this.writeTmp(claim);
+    try {
+      await link(tmp, this.genPath(gen));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    } finally {
+      await rm(tmp, { force: true });
+    }
+  }
+
+  /** Rewrite our own pending generation (no one else writes it). */
+  async update(gen: number, claim: Claim): Promise<void> {
+    await rename(await this.writeTmp(claim), this.genPath(gen));
+  }
+
+  private async writeTmp(claim: Claim): Promise<string> {
+    const tmp = path.join(this.dir, `.tmp-${process.pid}-${randomBytes(4).toString("hex")}`);
+    await writeFile(tmp, JSON.stringify(claim), { mode: 0o600 });
+    return tmp;
+  }
+
+  genPath(gen: number): string {
+    return path.join(this.dir, String(gen).padStart(8, "0"));
+  }
+
+  /** Where generation `gen` is stored (0 = the 0.5.x claim file). */
+  recordPath(gen: number): string {
+    return gen === 0 ? this.legacyFile : this.genPath(gen);
+  }
+}
+
+/**
+ * Identifies one run of a process, so a PID reused by another process is not
+ * mistaken for the owner: the start time from /proc on Linux, from ps
+ * elsewhere. null when it cannot be read.
+ */
+async function processStartToken(pid: number): Promise<string | null> {
+  if (process.platform === "linux") {
+    const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+    // Field 22 (starttime); the command name in field 2 may contain spaces.
+    const fields = stat?.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return fields?.[19] ?? null;
+  }
+  const out = await run("ps", ["-o", "lstart=", "-p", String(pid)], {
+    timeout: 5000,
+    env: { ...process.env, LC_ALL: "C", LANG: "C" },
+  }).catch(() => null);
+  return out?.stdout.trim() || null;
+}
+
+/** Is the process that wrote this claim still running? */
+async function ownerAlive(claim: Claim): Promise<boolean> {
+  if (!pidAlive(claim.pid)) return false;
+  if (!claim.pidStart) return true; // 0.5.2 claim: the PID is all we know
+  const now = await processStartToken(claim.pid);
+  return now === null || now === claim.pidStart;
 }
 
 function pidAlive(pid: number): boolean {
@@ -132,8 +244,9 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-export const MEMORY_MAX_PATTERN = /^(\d+[KMGT]?|\d{1,3}%)$/i;
-export const CPU_QUOTA_PATTERN = /^\d{1,5}%$/;
+// systemd rejects 0% CPU and kills a job at once with MemoryMax=0.
+export const MEMORY_MAX_PATTERN = /^([1-9]\d*[KMGT]?|([1-9]\d?|100)%)$/i;
+export const CPU_QUOTA_PATTERN = /^[1-9]\d{0,4}%$/;
 export const KEY_PATTERN = /^[\x21-\x7e]{1,200}$/;
 
 /**
@@ -365,12 +478,21 @@ function userEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+// Keyed starts in this OS process, by root and key: every JobManager on one
+// root shares them, so a pending claim of this process is never in flight
+// outside the lock.
+const keyLocks = new Map<string, Promise<unknown>>();
+
 export class JobManager {
   private systemd: Promise<boolean> | null = null;
 
   constructor(
     private readonly root: string,
-    private readonly options: { forceDetached?: boolean } = {},
+    private readonly options: {
+      forceDetached?: boolean;
+      /** Shell for detached jobs (tests point it at a missing file). */
+      shell?: string;
+    } = {},
   ) {}
 
   private jobsDir(): string {
@@ -406,20 +528,22 @@ export class JobManager {
   async startWithChecks(
     input: StartInput,
   ): Promise<Job & { warnings: string[]; reused: boolean }> {
+    input = { ...input, cwd: path.resolve(input.cwd) };
     let job: Job;
     let reused = false;
     if (input.key) {
-      // Starts with one key run one after another in this process; there is
-      // no timeout after which a pending start is assumed dead.
+      // Starts with one key run one after another in this process; other
+      // processes are kept out by the claim log (see startKeyed).
       const hash = keyHash(input.key);
-      const previous = this.keyLocks.get(hash) ?? Promise.resolve();
+      const lock = `${this.root}\0${hash}`;
+      const previous = keyLocks.get(lock) ?? Promise.resolve();
       const mine = previous.then(() => this.startKeyed(input, hash));
       const tail = mine.catch(() => undefined);
-      this.keyLocks.set(hash, tail);
+      keyLocks.set(lock, tail);
       try {
         ({ job, reused } = await mine);
       } finally {
-        if (this.keyLocks.get(hash) === tail) this.keyLocks.delete(hash);
+        if (keyLocks.get(lock) === tail) keyLocks.delete(lock);
       }
     } else {
       job = await this.start(input);
@@ -437,165 +561,274 @@ export class JobManager {
     return { ...job, warnings, reused };
   }
 
-  private readonly keyLocks = new Map<string, Promise<unknown>>();
+  private ownStart: Promise<string | null> | null = null;
 
-  private claimPath(hash: string): string {
-    return path.join(this.root, "keys", hash);
+  private claims(hash: string): ClaimLog {
+    return new ClaimLog(path.join(this.root, "claims", hash), path.join(this.root, "keys", hash));
+  }
+
+  private ownToken(): Promise<string | null> {
+    return (this.ownStart ??= processStartToken(process.pid));
+  }
+
+  private async myClaim(state: Claim["state"], jobId: string | null, fingerprint: string | null): Promise<Claim> {
+    return { state, pid: process.pid, pidStart: await this.ownToken(), jobId, fingerprint };
+  }
+
+  /** The job a "done" claim points at, if it still exists. */
+  private jobOf(claim: Claim | "corrupt" | undefined): string | null {
+    return claim && claim !== "corrupt" && claim.state === "done" && claim.jobId &&
+      existsSync(path.join(this.dir(claim.jobId), "meta.json"))
+      ? claim.jobId
+      : null;
   }
 
   /**
    * One keyed start, run while holding this process's lock for the key.
-   *
-   * keys/<sha256 of key> holds {state, pid, jobId, fingerprint}:
-   * - none: claim it ("pending" with our pid), start, then record "done".
-   * - "done" and the job still exists: reuse it if the request matches
-   *   (key_conflict otherwise); a pruned job frees the key.
-   * - "pending" by another live process: key_busy (never taken over).
+   * The latest claim decides:
+   * - none, "failed", "released", or "done" whose job was pruned: the key is
+   *   free. Claim it ("pending"), start, then record "done" or "failed".
+   * - "done" and the job exists: reuse it if the request matches
+   *   (key_conflict otherwise).
+   * - "pending" by another live process: key_busy (never taken over by time).
    * - "pending" by a dead process, or by this process outside the lock (a
-   *   start that failed half-way): look for the job directory marked with
-   *   the key. None: nothing was started, claim again. With meta.json: adopt
-   *   it. Without meta.json: key_unknown; `release-key` after inspection.
+   *   start that failed half-way): look at the job directory marked with the
+   *   key. Started: adopt it. Never started, or none: claim again.
+   *   Launched but unclear: key_unknown; `release-key` after inspection.
+   * - unreadable: key_unknown.
+   * Every change is a new generation that only one process can create; a
+   * process that loses looks again.
    */
   private async startKeyed(
     input: StartInput,
     hash: string,
   ): Promise<{ job: Job; reused: boolean }> {
-    await mkdir(path.join(this.root, "keys"), { recursive: true, mode: 0o700 });
-    const file = this.claimPath(hash);
+    const key = input.key!;
+    const log = this.claims(hash);
     const fingerprint = requestFingerprint(input);
-    const claim = await readClaim(file);
-    if (claim) {
-      if (claim.state === "done" && claim.jobId) {
-        if (existsSync(path.join(this.dir(claim.jobId), "meta.json"))) {
-          return { job: await this.reuse(claim.jobId, claim.fingerprint, fingerprint, input.key!), reused: true };
-        }
-        // That job was pruned: the key is free again.
-      } else if (claim.state === "pending") {
-        if (claim.pid !== process.pid && pidAlive(claim.pid)) {
+    for (let attempt = 0; attempt < CLAIM_ATTEMPTS; attempt++) {
+      const latest = await log.latest();
+      const next = (latest?.gen ?? 0) + 1;
+      const claim = latest?.claim;
+      if (claim === "corrupt") {
+        throw new Error(
+          `key_unknown: the claim for --key ${key} cannot be read (${log.recordPath(latest!.gen)}); check bb jobs list --all for a job it started, then run bb jobs release-key`,
+        );
+      }
+      const owned = this.jobOf(claim);
+      if (owned) return { job: await this.reuse(owned, claim!.fingerprint, input), reused: true };
+      if (claim?.state === "pending") {
+        const mine = claim.pid === process.pid && claim.pidStart === (await this.ownToken());
+        if (!mine && (await ownerAlive(claim))) {
           throw new Error(
-            `key_busy: a start with --key ${input.key} is in progress in process ${claim.pid}; try again later`,
+            `key_busy: a start with --key ${key} is in progress in process ${claim.pid}; try again later`,
           );
         }
         const found = await this.findKeyedJob(hash);
-        if (found?.hasMeta) {
-          await writeClaim(file, { state: "done", pid: process.pid, jobId: found.id, fingerprint: claim.fingerprint });
-          return { job: await this.reuse(found.id, claim.fingerprint, fingerprint, input.key!), reused: true };
+        if (found?.status === "started") {
+          if (!(await log.create(next, await this.myClaim("done", found.id, claim.fingerprint)))) continue;
+          return { job: await this.reuse(found.id, claim.fingerprint, input), reused: true };
         }
-        if (found) {
+        if (found?.status === "incomplete") {
+          // The directory may belong to a start that claimed the key after
+          // we read the claim and is launching right now: look again.
+          if ((await log.latest())?.gen !== latest!.gen) continue;
+          const listed = existsSync(path.join(this.dir(found.id), "meta.json"));
           throw new Error(
-            `key_unknown: a start with --key ${input.key} stopped half-way and left ${this.dir(found.id)} without meta.json; check whether its command ran, then run bb jobs release-key`,
+            `key_unknown: a start with --key ${key} stopped half-way and left ${listed ? `job ${found.id}` : this.dir(found.id)}; it may have run. Check ` +
+              (listed ? `bb jobs status ${found.id}` : `that directory's output.log`) +
+              (process.platform === "linux" ? ` and systemctl --user status bbjob-${found.id}` : "") +
+              `, stop it if needed, then run bb jobs release-key`,
           );
         }
-        // No job directory: that start never got as far as running anything.
+        // Not started, or no job directory: that start ran nothing.
       }
-    }
-    const pending: Claim = { state: "pending", pid: process.pid, jobId: null, fingerprint };
-    if (claim) {
-      await writeClaim(file, pending); // checked above: free to take
-    } else {
-      // No claim yet: create it atomically, in case another process races us.
+      const claimed = await log
+        .create(next, await this.myClaim("pending", null, fingerprint))
+        .catch((error: unknown) => {
+          throw new Error(`start_refused: cannot record the claim for --key ${key}: ${errorText(error)}`);
+        });
+      if (!claimed) continue;
+      let job: Job;
       try {
-        const handle = await open(file, "wx", 0o600);
-        await handle.writeFile(JSON.stringify(pending));
-        await handle.close();
+        job = await this.start({ ...input, keyHash: hash });
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        throw new Error(
-          `key_busy: another process claimed --key ${input.key} at the same moment; try again`,
-        );
+        // Only a refusal proves that nothing ran. Any other error keeps the
+        // claim pending; the next attempt reconciles it from the job
+        // directory (adopts a started job, key_unknown when unclear).
+        if (/^start_refused: /.test((error as Error).message)) {
+          await log.update(next, await this.myClaim("failed", null, fingerprint));
+        }
+        throw error;
       }
+      await log.update(next, await this.myClaim("done", job.id, fingerprint));
+      return { job, reused: false };
     }
-    let job: Job;
-    try {
-      job = await this.start({ ...input, keyHash: hash });
-    } catch (error) {
-      // If start() created a job directory, the claim stays pending and the
-      // next attempt reconciles it from that directory.
-      if (!(await this.findKeyedJob(hash))) await rm(file, { force: true });
-      throw error;
-    }
-    await writeClaim(file, { state: "done", pid: process.pid, jobId: job.id, fingerprint });
-    return { job, reused: false };
+    throw keepsChanging(key);
   }
 
-  private async reuse(
-    jobId: string,
-    recorded: string | null,
-    fingerprint: string,
-    key: string,
-  ): Promise<Job> {
-    // The job's own record wins over the claim file.
+  private async reuse(jobId: string, recorded: string | null, input: StartInput): Promise<Job> {
+    // The job's own record wins over the claim.
     const meta = await this.readMeta(jobId);
     const expected = meta.keyFingerprint ?? recorded;
-    if (expected && expected !== fingerprint) {
+    const matches = expected
+      ? expected === requestFingerprint(input)
+      : // 0.5.0/0.5.1 kept no fingerprint: compare what the job recorded.
+        meta.command === input.command && path.resolve(meta.cwd) === input.cwd;
+    if (!matches) {
       throw new Error(
-        `key_conflict: --key ${key} was used for a different request (command, directory, environment, env file, limits or timeout) by job ${jobId}; use a new key`,
+        `key_conflict: --key ${input.key} was used for a different request (command, directory, environment, env file path, limits or timeout) by job ${jobId}; use a new key`,
       );
     }
     return this.get(jobId);
   }
 
-  /** The job directory whose `key` marker holds this key hash, if any. */
-  private async findKeyedJob(hash: string): Promise<{ id: string; hasMeta: boolean } | null> {
-    for (const id of await readdir(this.jobsDir()).catch(() => [] as string[])) {
-      const marker = await readFile(path.join(this.dir(id), "key"), "utf8").catch(() => null);
-      if (marker?.trim() === hash) {
-        return { id, hasMeta: existsSync(path.join(this.dir(id), "meta.json")) };
+  /**
+   * The job directory whose `key` marker holds this key hash. A started job
+   * wins over a half-way one, which wins over one that never started; among
+   * equals, the newest.
+   */
+  private async findKeyedJob(
+    hash: string,
+  ): Promise<{ id: string; status: "started" | "incomplete" | "not-started" } | null> {
+    let best: { id: string; status: "started" | "incomplete" | "not-started"; born: number } | null = null;
+    const rank = { started: 3, incomplete: 2, "not-started": 1 } as const;
+    for (const id of await this.markedDirs(hash)) {
+      const status = await this.launchStatus(id);
+      const meta = await this.readMeta(id).catch(() => null);
+      const dirStat = await stat(this.dir(id)).catch(() => null);
+      const born = meta ? Date.parse(meta.createdAt) : dirStat?.birthtimeMs || dirStat?.ctimeMs || 0;
+      if (
+        !best ||
+        rank[status] > rank[best.status] ||
+        (rank[status] === rank[best.status] && born > best.born)
+      ) {
+        best = { id, status, born };
       }
     }
-    return null;
+    return best && { id: best.id, status: best.status };
+  }
+
+  /** Job directories marked with this key hash. */
+  private async markedDirs(hash: string): Promise<string[]> {
+    const ids: string[] = [];
+    for (const id of await readdir(this.jobsDir()).catch(() => [] as string[])) {
+      const marker = await readFile(path.join(this.dir(id), "key"), "utf8").catch(() => null);
+      if (marker?.trim() === hash) ids.push(id);
+    }
+    return ids;
   }
 
   /**
-   * Free a key after a human checked a key_unknown/key_busy state: the claim
-   * file is renamed, never deleted.
+   * Did this job's command start? An exit code, or meta.json without a
+   * `launch` file: yes. `launch` = not-started, or launching without
+   * meta.json (meta.json is written before the launch): no. `launch` =
+   * launching: yes while it runs, otherwise unknown. No meta.json and no
+   * `launch` (a 0.5.2 start that stopped half-way): unknown.
    */
-  async releaseKey(key: string): Promise<{ released: boolean; state: string; backup: string | null }> {
-    const file = this.claimPath(keyHash(key));
-    const claim = await readClaim(file);
-    if (!claim) return { released: false, state: "none", backup: null };
-    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
-    const backup = `${file}.bak-${stamp}`;
-    await rename(file, backup);
-    return { released: true, state: claim.state, backup };
+  private async launchStatus(id: string): Promise<"started" | "incomplete" | "not-started"> {
+    const dir = this.dir(id);
+    if (existsSync(path.join(dir, "exit"))) return "started";
+    const launch = await this.readLaunch(id);
+    const meta = await this.readMeta(id).catch(() => null);
+    if (launch === "not-started" || (launch === "launching" && !meta)) return "not-started";
+    if (meta && launch === undefined) return "started";
+    if (meta && (await this.isAlive(meta))) return "started";
+    return "incomplete";
   }
 
+  /**
+   * Free a key after checking a key_unknown state, so the next start runs
+   * the command again. Without `force` it is refused while the key may still
+   * lead to a live or existing job: a start in progress in a live process, a
+   * job the key started, or a marked job directory whose command started.
+   * Nothing is deleted: a "released" generation is added to the key's
+   * history, and every job directory marked with the key loses its marker
+   * (renamed), so none of them is adopted later.
+   */
+  async releaseKey(
+    key: string,
+    options: { force?: boolean } = {},
+  ): Promise<{ released: boolean; state: string; backup: string | null }> {
+    const hash = keyHash(key);
+    const log = this.claims(hash);
+    for (let attempt = 0; attempt < CLAIM_ATTEMPTS; attempt++) {
+      const latest = await log.latest();
+      if (!latest) return { released: false, state: "none", backup: null };
+      const claim = latest.claim === "corrupt" ? null : latest.claim;
+      const state = claim?.state ?? "unreadable";
+      if (claim?.state === "failed" || claim?.state === "released") {
+        return { released: false, state, backup: null };
+      }
+      if (!options.force) {
+        const refuse = (why: string) =>
+          new Error(
+            `key_in_use: --key ${key} ${why}; releasing it lets the same command run again. Add --force if that is intended`,
+          );
+        if (claim?.state === "pending" && (await ownerAlive(claim))) {
+          throw refuse(`has a start in progress in process ${claim.pid}; wait for it`);
+        }
+        const owned = this.jobOf(latest.claim);
+        if (owned) {
+          const job = await this.get(owned);
+          throw refuse(`belongs to job ${job.id} (${job.state})`);
+        }
+        const found = await this.findKeyedJob(hash);
+        if (found?.status === "started") {
+          throw refuse(`started job ${found.id}, which a retry with the key returns`);
+        }
+      }
+      if (!(await log.create(latest.gen + 1, await this.myClaim("released", null, null)))) continue;
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+      for (const id of await this.markedDirs(hash)) {
+        const marker = path.join(this.dir(id), "key");
+        await rename(marker, `${marker}.released-${stamp}`).catch(() => undefined);
+      }
+      return { released: true, state, backup: log.recordPath(latest.gen) };
+    }
+    throw keepsChanging(key);
+  }
+
+  /**
+   * Start a job. Errors that start with "start_refused:" mean nothing ran;
+   * any other error leaves it open whether the command started.
+   */
   async start(input: StartInput): Promise<Job> {
+    const refuse = (message: string) => new Error(`start_refused: ${message}`);
     if (process.platform === "win32") {
-      throw new Error(
-        "bb jobs needs a POSIX machine (Linux or macOS; WSL works). Native Windows is not supported.",
-      );
+      throw refuse("bb jobs needs a POSIX machine (Linux or macOS; WSL works). Native Windows is not supported.");
     }
     await mkdir(this.jobsDir(), { recursive: true, mode: 0o700 });
     const cwdStat = await stat(input.cwd).catch(() => null);
     if (!cwdStat?.isDirectory()) {
-      throw new Error(`working directory does not exist: ${input.cwd}`);
+      throw refuse(`working directory does not exist: ${input.cwd}`);
     }
     if (input.envFile) {
       if (!path.isAbsolute(input.envFile)) {
-        throw new Error(`--env-file must be an absolute path on the job's machine: ${input.envFile}`);
+        throw refuse(`--env-file must be an absolute path on the job's machine: ${input.envFile}`);
       }
       const envStat = await stat(input.envFile).catch(() => null);
-      if (!envStat?.isFile()) throw new Error(`--env-file not found: ${input.envFile}`);
+      if (!envStat?.isFile()) throw refuse(`--env-file not found: ${input.envFile}`);
       if (envStat.mode & 0o077) {
-        throw new Error(
+        throw refuse(
           `--env-file ${input.envFile} is readable or writable by other users (mode ${(envStat.mode & 0o777).toString(8)}); run chmod 600 on it. The job was not started`,
         );
       }
     }
     if (input.memoryMax && !MEMORY_MAX_PATTERN.test(input.memoryMax)) {
-      throw new Error(`bad --memory-max ${input.memoryMax}: use bytes with K/M/G/T, or a percentage`);
+      throw refuse(`bad --memory-max ${input.memoryMax}: use bytes with K/M/G/T, or a percentage from 1% to 100%`);
     }
     if (input.cpuQuota && !CPU_QUOTA_PATTERN.test(input.cpuQuota)) {
-      throw new Error(`bad --cpu-quota ${input.cpuQuota}: use a percentage such as 150%`);
+      throw refuse(`bad --cpu-quota ${input.cpuQuota}: use a percentage above 0, such as 150%`);
     }
     const limits = [
       input.memoryMax ? `MemoryMax=${input.memoryMax}` : null,
       input.cpuQuota ? `CPUQuota=${input.cpuQuota}` : null,
       input.tasksMax ? `TasksMax=${input.tasksMax}` : null,
     ].filter((l): l is string => l !== null);
-    if ((limits.length || input.requireSystemd) && !(await this.hasSystemd())) {
-      throw new Error(
+    const systemd = await this.hasSystemd();
+    if ((limits.length || input.requireSystemd) && !systemd) {
+      throw refuse(
         limits.length
           ? "--memory-max, --cpu-quota and --tasks-max need user systemd, which this machine does not have; the job was not started"
           : "user systemd is not available on this machine and --require-systemd forbids detached mode; the job was not started",
@@ -604,31 +837,63 @@ export class JobManager {
     const id = `${slug(input.name)}-${randomBytes(3).toString("hex")}`;
     const logMaxBytes = input.logMaxBytes ?? DEFAULT_LOG_MAX_BYTES;
     const dir = this.dir(id);
-    await mkdir(dir, { mode: 0o700 });
-    // Written before anything can run, so a keyed start that dies half-way
-    // can be found again (see startKeyed).
-    if (input.keyHash) await writeFile(path.join(dir, "key"), input.keyHash, { mode: 0o600 });
-    // Per-job copies: bash reads a script while it runs, so a shared runner
-    // rewritten by a later start could corrupt jobs already running.
     const runner = path.join(dir, "runner.sh");
-    await writeFile(runner, RUNNER, { mode: 0o700 });
-    await writeFile(path.join(dir, "exec.pl"), EXEC_PL, { mode: 0o600 });
     const envFile = path.join(dir, "env.sh");
-    const exports = Object.entries(input.env)
-      .map(([key, value]) => `export ${key}=${shellQuote(value)}\n`)
-      .join("");
-    if (exports) await writeFile(envFile, exports, { mode: 0o600 });
-    await writeFile(
-      path.join(dir, "command.sh"),
-      `${ENV_PRELUDE}${input.envFile ? envFileLoader(input.envFile) : ""}${input.command}\n`,
-      { mode: 0o600 },
-    );
-    await writeFile(path.join(dir, "cwd"), input.cwd);
-    if (input.timeoutSec !== null) {
-      await writeFile(path.join(dir, "timeout"), String(input.timeoutSec));
+    const launchFile = path.join(dir, "launch");
+    const mode: JobMeta["mode"] = systemd ? "systemd" : "detached";
+    const unit = systemd ? `bbjob-${id}` : null;
+    const meta: JobMeta = {
+      id,
+      name: input.name,
+      command: input.command,
+      cwd: input.cwd,
+      mode,
+      unit,
+      pid: null,
+      createdAt: new Date().toISOString(),
+      timeoutSec: input.timeoutSec,
+      logMaxBytes,
+      threadId: input.threadId,
+      format: 2,
+      ...(input.keyHash ? { keyFingerprint: requestFingerprint(input) } : {}),
+    };
+    // Nothing has run yet: on any failure, mark the directory as such.
+    const notStarted = async (message: string): Promise<never> => {
+      await rm(envFile, { force: true });
+      await writeFile(launchFile, "not-started\n").catch(() => undefined);
+      throw refuse(message);
+    };
+    await mkdir(dir, { mode: 0o700 });
+    try {
+      // Written before anything can run, so a keyed start that dies half-way
+      // can be found again (see startKeyed).
+      await writeFile(launchFile, "launching\n");
+      if (input.keyHash) await writeFile(path.join(dir, "key"), input.keyHash, { mode: 0o600 });
+      // Per-job copies: bash reads a script while it runs, so a shared runner
+      // rewritten by a later start could corrupt jobs already running.
+      await writeFile(runner, RUNNER, { mode: 0o700 });
+      await writeFile(path.join(dir, "exec.pl"), EXEC_PL, { mode: 0o600 });
+      const exports = Object.entries(input.env)
+        .map(([key, value]) => `export ${key}=${shellQuote(value)}\n`)
+        .join("");
+      if (exports) await writeFile(envFile, exports, { mode: 0o600 });
+      await writeFile(
+        path.join(dir, "command.sh"),
+        `${ENV_PRELUDE}${input.envFile ? envFileLoader(input.envFile) : ""}${input.command}\n`,
+        { mode: 0o600 },
+      );
+      await writeFile(path.join(dir, "cwd"), input.cwd);
+      if (input.timeoutSec !== null) {
+        await writeFile(path.join(dir, "timeout"), String(input.timeoutSec));
+      }
+      await writeFile(path.join(dir, "log-max"), String(logMaxBytes));
+      await writeFile(path.join(dir, "output.log"), "", { mode: 0o600 });
+      // Before the launch, so a job whose launch result is lost can still be
+      // listed and stopped.
+      await writeFile(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2), { mode: 0o600 });
+    } catch (error) {
+      await notStarted(`could not prepare the job directory: ${errorText(error)}`);
     }
-    await writeFile(path.join(dir, "log-max"), String(logMaxBytes));
-    await writeFile(path.join(dir, "output.log"), "", { mode: 0o600 });
 
     const base = userEnv();
     const inherited: Record<string, string> = {};
@@ -640,12 +905,7 @@ export class JobManager {
       if (/^BB_[A-Z_]+$/.test(key)) inherited[key] = value;
     }
 
-    let mode: JobMeta["mode"];
-    let unit: string | null = null;
-    let pid: number | null = null;
-    if (await this.hasSystemd()) {
-      mode = "systemd";
-      unit = `bbjob-${id}`;
+    if (unit) {
       const args = [
         "--user",
         `--unit=${unit}`,
@@ -663,28 +923,39 @@ export class JobManager {
       try {
         await run("systemd-run", args, { env: base, timeout: 15000 });
       } catch (error) {
-        await rm(envFile, { force: true });
-        throw new Error(`systemd-run failed: ${errorText(error)}`);
+        // systemd-run that failed on its own (bad property, no bus) leaves no
+        // unit behind. A timeout, or a unit that exists, may have started.
+        const timedOut = (error as { killed?: boolean }).killed === true;
+        // A unit that already ran and was collected is not-found too: its
+        // exit code or output tells it apart.
+        const ran =
+          existsSync(path.join(dir, "exit")) ||
+          ((await stat(path.join(dir, "output.log")).catch(() => null))?.size ?? 0) > 0;
+        if (!timedOut && !ran && (await this.unitLoadState(unit)) === "not-found") {
+          await notStarted(`systemd-run failed: ${errorText(error)}`);
+        }
+        // env.sh stays: the job may still read it. describe() removes it once
+        // the job is known not to run.
+        throw new Error(
+          `systemd-run did not confirm job ${id} (${errorText(error)}); it may be running: check bb jobs status ${id}`,
+        );
       }
-      pid = await this.unitMainPid(unit);
+      meta.pid = await this.unitMainPid(unit);
     } else {
-      mode = "detached";
       // detached: true makes the child a session + process-group leader, so
       // it outlives this worker.
-      const child = spawn("/bin/bash", [runner, dir], {
+      const child = spawn(this.options.shell ?? "/bin/bash", [runner, dir], {
         cwd: input.cwd,
         detached: true,
         stdio: "ignore",
         env: inherited,
       });
-      pid = await new Promise<number>((resolve, reject) => {
+      const pid = await new Promise<number>((resolve, reject) => {
         child.once("error", reject);
         child.once("spawn", () => resolve(child.pid ?? -1));
-      }).catch(async (error: unknown) => {
-        await rm(envFile, { force: true });
-        throw error;
-      });
+      }).catch((error: unknown) => notStarted(`could not start bash: ${errorText(error)}`));
       child.unref();
+      meta.pid = pid;
       // Until the fork has exec'd bash, ps shows it as node and the job
       // would read as "lost". Wait briefly until it is recognisable.
       const deadline = Date.now() + 3000;
@@ -697,32 +968,21 @@ export class JobManager {
       }
     }
 
-    const meta: JobMeta = {
-      id,
-      name: input.name,
-      command: input.command,
-      cwd: input.cwd,
-      mode,
-      unit,
-      pid,
-      createdAt: new Date().toISOString(),
-      timeoutSec: input.timeoutSec,
-      logMaxBytes,
-      threadId: input.threadId,
-      format: 2,
-      ...(input.keyHash ? { keyFingerprint: requestFingerprint(input) } : {}),
-    };
     await writeFile(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2), {
       mode: 0o600,
     });
+    await rm(launchFile, { force: true });
     return this.get(id);
   }
 
   /** Newest first; with `threadId`, only jobs started from that thread. */
   async list(limit: number, threadId: string | null = null): Promise<Job[]> {
-    const metas = (await this.readAllMeta()).filter(
-      (m) => threadId === null || m.threadId === threadId,
-    );
+    const metas: JobMeta[] = [];
+    for (const m of await this.readAllMeta()) {
+      if (threadId !== null && m.threadId !== threadId) continue;
+      // A launch that failed before any process existed is not a job.
+      if ((await this.readLaunch(m.id)) !== "not-started") metas.push(m);
+    }
     metas.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return Promise.all(metas.slice(0, limit).map((m) => this.describe(m)));
   }
@@ -902,6 +1162,14 @@ export class JobManager {
       if (job.state === "running") continue;
       const ended = Date.parse(job.finishedAt ?? job.createdAt);
       if (ended > cutoff) continue;
+      // A keyed job whose claim was not settled (half-way start, owner gone
+      // before recording "done") keeps its key until a start or release-key
+      // settles it; archiving it would free the key silently.
+      const marker = await readFile(path.join(this.dir(meta.id), "key"), "utf8").catch(() => null);
+      if (marker) {
+        const latest = await this.claims(marker.trim()).latest();
+        if (latest?.claim === "corrupt" || latest?.claim.state === "pending") continue;
+      }
       const dir = this.dir(meta.id);
       const bytes = await dirSize(dir);
       if (!options.dryRun) {
@@ -934,6 +1202,20 @@ export class JobManager {
     } catch {
       throw new Error(`no job with id ${id} on this machine`);
     }
+  }
+
+  /** The job's `launch` marker: "launching", "not-started", or undefined. */
+  private async readLaunch(id: string): Promise<string | undefined> {
+    return (await readFile(path.join(this.dir(id), "launch"), "utf8").catch(() => null))?.trim();
+  }
+
+  /** "loaded", "not-found", ...; null when systemctl does not answer. */
+  private async unitLoadState(unit: string): Promise<string | null> {
+    const out = await run("systemctl", ["--user", "show", "-p", "LoadState", "--value", unit], {
+      env: userEnv(),
+      timeout: 5000,
+    }).catch(() => null);
+    return out?.stdout.trim() || null;
   }
 
   private async unitMainPid(unit: string): Promise<number | null> {
@@ -998,6 +1280,7 @@ export class JobManager {
     const alive = exitCode === null && (await this.isAlive(meta));
     if (exitCode === null && !alive) exitCode = await readExit();
     const stopRequested = existsSync(path.join(dir, "stop-requested"));
+    const launch = await this.readLaunch(meta.id);
     let state: JobState;
     let finishedAt: string | null = null;
     if (exitCode !== null) {
@@ -1005,6 +1288,12 @@ export class JobManager {
       finishedAt = (await stat(path.join(dir, "exit"))).mtime.toISOString();
     } else if (alive) {
       state = "running";
+    } else if (launch === "not-started") {
+      state = "not-started";
+    } else if (launch === "launching" && !stopRequested) {
+      // The start did not finish and nothing runs: whether the command ran
+      // at all is unknown.
+      state = "incomplete";
     } else {
       state = stopRequested ? "stopped" : "lost";
       const log = await stat(path.join(dir, "output.log")).catch(() => null);

@@ -718,17 +718,27 @@ export default async function plugin(bb: BbPluginApi) {
               hostId,
               ctx.signal,
             ).catch((error: unknown) => {
-              // The machine refused the job (missing cwd or env file, no
-              // systemd for limits, a key conflict): a usage error, not a
-              // plugin failure. key_* errors keep their code.
+              // A refusal (missing cwd or env file, no systemd for limits, a
+              // key state) is a usage error, not a plugin failure. Anything
+              // else, a timeout above all, may have started the job.
+              const coded = codedError(error);
+              if (coded) {
+                throw new PluginCliError(coded.text, {
+                  code: coded.code,
+                  hint:
+                    coded.code === "key_unknown"
+                      ? `After checking that it did not run, free the key with: bb jobs release-key ${shellQuote(input.options.key ?? "")}`
+                      : coded.code === "key_busy"
+                        ? "Another start with this key is still running: wait and repeat the same command."
+                        : undefined,
+                });
+              }
               const message = error instanceof Error ? error.message : String(error);
-              const coded = message.match(/^(key_[a-z]+): ([\s\S]*)$/);
-              throw new PluginCliError(coded ? coded[2]! : message, {
-                code: coded ? coded[1]! : "start_refused",
-                hint:
-                  coded?.[1] === "key_unknown" || coded?.[1] === "key_busy"
-                    ? `After checking, free the key with: bb jobs release-key '${input.options.key}'`
-                    : undefined,
+              throw new PluginCliError(`the start was not confirmed: ${message}`, {
+                code: "start_unknown",
+                hint: input.options.key
+                  ? `The job may be running. Repeat the same command with the same --key: it returns the job if it started, or key_unknown if that cannot be told.`
+                  : `The job may be running: check bb jobs list before starting it again, and use --key for starts that must not run twice.`,
               });
             });
             if (notifyThread) {
@@ -1057,20 +1067,39 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
         "release-key": cliCommand({
-          summary: "Free an idempotency key after checking a key_unknown or key_busy state",
+          summary: "Free an idempotency key after checking a key_unknown state",
           description:
-            "Renames the key's claim file (keeps a .bak copy). Use only after checking that the earlier start with this key did not run, or that you accept running the command again.",
+            "Lets the next start with this key run the command again. Use only after checking that the earlier start did not run, or that you accept running the command again. Without --force it is refused while a start with the key is in progress or a job it started still exists. Nothing is deleted: the key's history keeps the old claim.",
           positionals: [{ name: "key", description: "The --key value", required: true }],
-          options: { machine: machineOption, json: jsonOption },
+          options: {
+            force: {
+              type: "boolean",
+              description: "Release even while a start is in progress or the key's job exists (the command may then run twice)",
+            },
+            machine: machineOption,
+            json: jsonOption,
+          },
           async run(input, ctx) {
             const hostId = await resolveHost(input.options.machine, ctx.threadId);
-            const result = await call("releaseKey", { key: input.positionals.key }, hostId, ctx.signal);
+            const result = await call(
+              "releaseKey",
+              { key: input.positionals.key, force: input.options.force },
+              hostId,
+              ctx.signal,
+            ).catch((error: unknown) => {
+              const coded = codedError(error);
+              if (!coded) throw error;
+              throw new PluginCliError(coded.text, { code: coded.code });
+            });
             if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(result, null, 2) };
+            const key = input.positionals.key;
             return {
               exitCode: 0,
               stdout: result.released
-                ? `Released --key ${input.positionals.key} (was ${result.state}); claim kept as ${result.backup}\n`
-                : `No claim for --key ${input.positionals.key} on this machine\n`,
+                ? `Released --key ${key} (was ${result.state}); old claim kept in ${result.backup}\n`
+                : result.state === "none"
+                  ? `No claim for --key ${key} on this machine\n`
+                  : `--key ${key} is already free (${result.state})\n`,
             };
           },
         }),
@@ -1133,6 +1162,16 @@ function describe(job: Job): string {
     job.state === "exited" ? `exited ${job.exitCode}` : job.state;
   const pid = job.pid ? ` pid ${job.pid}` : "";
   return `${job.id}  ${result}  [${job.mode}${pid}]  started ${job.createdAt}  cwd ${job.cwd}`;
+}
+
+/**
+ * The machine side reports known outcomes as "<code>: <text>" (key_busy,
+ * key_unknown, key_conflict, key_in_use, start_refused).
+ */
+function codedError(error: unknown): { code: string; text: string } | null {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/^(key_[a-z_]+|start_refused): ([\s\S]*)$/);
+  return match ? { code: match[1]!, text: match[2]! } : null;
 }
 
 function notFound(error: unknown): never {
