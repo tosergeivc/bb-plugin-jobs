@@ -48,6 +48,8 @@ const SENT_TTL_MS = 24 * 3600 * 1000;
 
 export default async function plugin(bb: BbPluginApi) {
   const host = bb.hosts.experimental_client({ contract: hostContract });
+  // Tests shorten the notice service's pause; production uses NOTIFY_POLL_MS.
+  const pollMs = Number(process.env.BB_JOBS_NOTIFY_POLL_MS) || NOTIFY_POLL_MS;
   const settings = bb.settings.define({
     notifyVisibility: {
       type: "select",
@@ -388,7 +390,7 @@ export default async function plugin(bb: BbPluginApi) {
           bb.log.warn(`notify pass failed: ${error instanceof Error ? error.message : String(error)}`),
         );
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, NOTIFY_POLL_MS);
+          const timer = setTimeout(resolve, pollMs);
           signal.addEventListener("abort", () => {
             clearTimeout(timer);
             resolve();

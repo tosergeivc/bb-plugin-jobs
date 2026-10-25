@@ -30,8 +30,10 @@
     "host": "./host.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "sh test/run.sh"
+    "typecheck": "npm run typecheck:min && npm run typecheck:latest",
+    "test": "sh test/run.sh",
+    "typecheck:min": "tsc --noEmit",
+    "typecheck:latest": "node scripts/typecheck-latest.mjs"
   },
   "dependencies": {
     "zod": "^4.6.5"
@@ -39,6 +41,7 @@
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.43",
     "@types/node": "^22.0.0",
+    "better-sqlite3": "^13.0.3",
     "esbuild": "0.28.1",
     "typescript": "^5.7.0"
   }
