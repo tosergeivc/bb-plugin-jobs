@@ -40,6 +40,19 @@ All commands accept `--machine <id|name>` to target another machine and
   redirects: `bb jobs start --name deploy -- './deploy.sh prod 2>&1 | tee deploy.txt'`.
   Several tokens are quoted one by one: `bb jobs start -- npm run dev`.
 - The job gets no stdin. Pass answers with flags or env, never prompts.
+- For a deploy or any command that must not run twice, pass `--key <stable id>`
+  (e.g. `--key deploy:<commit>`): if your first `start` answer was lost, the
+  same command with the same key returns the existing job instead of a second
+  run.
+- Secrets: put them in a chmod-600 `KEY=VALUE` file on the job's machine and
+  pass `--env-file /absolute/path`; never type a secret in the command or in
+  `--env`.
+- For critical work add `--require-systemd` (and limits such as
+  `--memory-max 2G`), so the job never silently runs detached or unbounded.
+- `ssh host cmd` as a job: stopping the job ends the local ssh client, not
+  necessarily the remote command.
+- Exit 0, a ready check or a notice mean the command ended; check the actual
+  result (artifact, health endpoint, version) before saying a deploy worked.
 - The job inherits only PATH, HOME, USER, SHELL, LANG, TZ and SSH_AUTH_SOCK
   from the machine; pass anything else with `--env`. `--env` values are not
   kept on disk after the job starts. Pass a secret as `--env TOKEN="$TOKEN"`,

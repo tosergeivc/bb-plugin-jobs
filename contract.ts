@@ -46,9 +46,17 @@ export const hostContract = defineRpcContract({
         threadId: z.string().nullable(),
         // BB_THREAD_ID, BB_THREAD_STORAGE, ... for the job's environment.
         bbEnv: z.record(z.string().regex(/^BB_[A-Z_]+$/), z.string()),
+        // Idempotency key: a repeated start returns the job of the first one.
+        key: z.string().regex(/^[\x21-\x7e]{1,200}$/).nullable(),
+        // Absolute path of a KEY=VALUE file on the job's machine.
+        envFile: z.string().min(1).max(4096).nullable(),
+        memoryMax: z.string().max(32).nullable(),
+        cpuQuota: z.string().max(16).nullable(),
+        tasksMax: z.number().int().min(1).max(1_000_000).nullable(),
+        requireSystemd: z.boolean(),
       })
       .strict(),
-    output: jobSchema.extend({ warnings: z.array(z.string()) }),
+    output: jobSchema.extend({ warnings: z.array(z.string()), reused: z.boolean() }),
   },
   list: {
     input: z

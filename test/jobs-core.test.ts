@@ -382,6 +382,69 @@ for (const forceDetached of [false, true]) {
       }
     });
 
+    it("--key: a repeated or concurrent start returns the same job; a failed start frees the key", async () => {
+      const keyed = new JobManager(mkdtempSync(path.join(tmpdir(), "bbjobs-key-")), { forceDetached });
+      const input = { ...base, name: "keyed", command: "sleep 20", key: "deploy:release-42" };
+      const [a, b, c] = await Promise.all([keyed.startWithChecks(input), keyed.startWithChecks(input), keyed.startWithChecks(input)]);
+      assert.equal(a.id, b.id);
+      assert.equal(b.id, c.id);
+      assert.equal([a, b, c].filter((j) => !j.reused).length, 1, "exactly one start");
+      assert.equal((await keyed.list(50)).length, 1, "one job on disk");
+      const again = await keyed.startWithChecks(input);
+      assert.equal(again.id, a.id);
+      assert.equal(again.reused, true);
+      await keyed.stop(a.id);
+      // A finished job still owns its key; after prune the key is free again.
+      assert.equal((await keyed.startWithChecks(input)).id, a.id);
+      await keyed.prune(0, { remove: false, dryRun: false });
+      const fresh = await keyed.startWithChecks({ ...input, command: "true" });
+      assert.notEqual(fresh.id, a.id);
+      assert.equal(fresh.reused, false);
+      // A start that fails releases its key.
+      await assert.rejects(keyed.startWithChecks({ ...input, key: "bad-cwd", cwd: "/nonexistent" }), /does not exist/);
+      const ok = await keyed.startWithChecks({ ...input, key: "bad-cwd", command: "true" });
+      assert.equal(ok.reused, false);
+    });
+
+    it("--env-file: values reach the command without being copied into the job directory", async () => {
+      const envPath = path.join(work, "secrets.env");
+      writeFileSync(envPath, "# deploy secrets\nexport TOKEN=sentinel-7f3a\nNAME=\"two words\"\nbad-name=x\n", { mode: 0o600 });
+      const job = await jobs.startWithChecks({
+        ...base,
+        name: "envfile",
+        command: 'printf "%s|%s\\n" "$TOKEN" "$NAME"',
+        envFile: envPath,
+      });
+      assert.deepEqual(job.warnings, []);
+      await until(() => jobs.get(job.id), (j) => j.state !== "running");
+      const { text } = await jobs.logs(job.id, 4096);
+      assert.match(text, /^sentinel-7f3a\|two words$/m);
+      const dir = path.dirname(job.logPath);
+      assert.deepEqual(grepDir(dir, "sentinel-7f3a").filter((f) => f !== "output.log"), [], "not stored outside the job's own output");
+      await assert.rejects(jobs.startWithChecks({ ...base, name: "x", command: "true", envFile: path.join(work, "missing.env") }), /--env-file not found/);
+      await assert.rejects(jobs.startWithChecks({ ...base, name: "x", command: "true", envFile: "relative.env" }), /absolute path/);
+      writeFileSync(path.join(work, "open.env"), "A=1\n", { mode: 0o644 });
+      const open = await jobs.startWithChecks({ ...base, name: "open", command: "true", envFile: path.join(work, "open.env") });
+      assert.match(open.warnings.join(" "), /readable by other users/);
+    });
+
+    it("resource limits and --require-systemd apply in systemd mode and refuse otherwise", async () => {
+      const limited = { ...base, name: "limited", command: "sleep 20", memoryMax: "64M", cpuQuota: "50%", tasksMax: 32 };
+      if (await jobs.hasSystemd()) {
+        const job = await jobs.startWithChecks({ ...limited, requireSystemd: true });
+        const show = execFileSync("systemctl", ["--user", "show", job.unit!, "-p", "MemoryMax", "-p", "TasksMax", "-p", "CPUQuotaPerSecUSec"]).toString();
+        assert.match(show, /MemoryMax=67108864/);
+        assert.match(show, /TasksMax=32/);
+        assert.match(show, /CPUQuotaPerSecUSec=500ms/);
+        await jobs.stop(job.id);
+      } else {
+        await assert.rejects(jobs.startWithChecks(limited), /need user systemd/);
+        await assert.rejects(jobs.startWithChecks({ ...base, name: "strict", command: "true", requireSystemd: true }), /--require-systemd/);
+      }
+      await assert.rejects(jobs.startWithChecks({ ...base, name: "bad", command: "true", memoryMax: "lots" }), /bad --memory-max/);
+      await assert.rejects(jobs.startWithChecks({ ...base, name: "bad", command: "true", cpuQuota: "1.5" }), /bad --cpu-quota/);
+    });
+
     it("lists newest first", async () => {
       const list = await jobs.list(50);
       assert.ok(list.length >= 3);

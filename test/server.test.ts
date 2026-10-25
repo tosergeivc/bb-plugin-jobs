@@ -46,6 +46,7 @@ async function until(check: () => boolean | Promise<boolean>, ms = 3000): Promis
 
 function setup() {
   const jobs = new Map<string, FakeJob>();
+  const keys = new Map<string, string>();
   const threadStatus = new Map<string, string>([[THREAD, "idle"], [OTHER, "idle"]]);
   const sends: { threadId: string; text: string; mode: string }[] = [];
   const queued = new Map<string, { id: string; updatedAt: number; text: string }[]>();
@@ -115,8 +116,12 @@ function setup() {
             timeoutSec: null, logMaxBytes: Number(input.logMaxBytes), threadId: (input.threadId as string) ?? null,
             logPath: `/data/jobs/${id}/output.log`, output: "",
           };
+          if (input.key && keys.has(String(input.key))) {
+            return { ...publicJob(jobs.get(keys.get(String(input.key))!)!), warnings: [], reused: true };
+          }
           jobs.set(id, job);
-          return { ...publicJob(job), warnings: [] };
+          if (input.key) keys.set(String(input.key), id);
+          return { ...publicJob(job), warnings: [], reused: false };
         }
         case "get":
           return publicJob(need(input.id));
@@ -313,6 +318,16 @@ describe("bb jobs CLI", () => {
     const forced = await t.harness.behavior.runCli(["stop", theirs, "--force"], { threadId: THREAD });
     assert.equal(forced.exitCode, 0, forced.stderr);
     assert.equal(t.jobs.get(theirs)!.state, "stopped");
+  });
+
+  it("says when --key returned an existing job instead of starting one", async () => {
+    const t = await boot();
+    const first = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "rel-1", "--", "true"], { threadId: THREAD });
+    const second = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "rel-1", "--", "true"], { threadId: THREAD });
+    assert.equal(first.exitCode, 0, first.stderr);
+    assert.ok(!/Reused job/.test(first.stdout));
+    assert.match(second.stdout, /^Reused job \S+: a job with --key rel-1 was already started/);
+    assert.equal(t.jobs.size, 1);
   });
 
   it("rejects --notify outside a thread with a hint", async () => {

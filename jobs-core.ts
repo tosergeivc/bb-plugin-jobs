@@ -28,7 +28,7 @@
 // command's process group and started no earlier than the job. macOS hides
 // other processes' environments, so an environment marker cannot be used.
 import { execFile, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   appendFile,
@@ -60,6 +60,48 @@ export interface StartInput {
   threadId: string | null;
   /** BB_* context variables (thread id, thread storage, ...). */
   bbEnv?: Record<string, string>;
+  /** Idempotency key: a second start with the same key returns the first job. */
+  key?: string | null;
+  /** Absolute path of a KEY=VALUE file on this machine, loaded by the job. */
+  envFile?: string | null;
+  /** systemd resource limits; they require systemd mode. */
+  memoryMax?: string | null;
+  cpuQuota?: string | null;
+  tasksMax?: number | null;
+  /** Fail instead of falling back to detached mode. */
+  requireSystemd?: boolean;
+}
+
+export const MEMORY_MAX_PATTERN = /^(\d+[KMGT]?|\d{1,3}%)$/i;
+export const CPU_QUOTA_PATTERN = /^\d{1,5}%$/;
+export const KEY_PATTERN = /^[\x21-\x7e]{1,200}$/;
+
+/**
+ * Bash that loads KEY=VALUE lines from a file into the job's environment
+ * without executing it: blank lines and # comments are skipped, an optional
+ * "export " prefix and one pair of surrounding quotes are removed, and
+ * invalid names are ignored. A missing file ends the job with code 126.
+ */
+export function envFileLoader(file: string): string {
+  return [
+    "__bbjobs_load_env() {",
+    "  local line key val",
+    "  while IFS= read -r line || [ -n \"$line\" ]; do",
+    "    line=\"${line%$'\\r'}\"",
+    "    case \"$line\" in ''|'#'*) continue ;; esac",
+    "    line=\"${line#export }\"",
+    "    key=\"${line%%=*}\"; val=\"${line#*=}\"",
+    "    [ \"$key\" = \"$line\" ] && continue",
+    "    case \"$key\" in [A-Za-z_]*) ;; *) continue ;; esac",
+    "    case \"$key\" in *[!A-Za-z0-9_]*) continue ;; esac",
+    "    case \"$val\" in \\\"*\\\"|\\'*\\') val=\"${val:1:${#val}-2}\" ;; esac",
+    "    export \"$key=$val\"",
+    "  done < \"$1\"",
+    "}",
+    `__bbjobs_load_env ${shellQuote(file)} || { echo "[jobs] cannot read --env-file ${file.replace(/[^\w./-]/g, "?")}" >&2; exit 126; }`,
+    "unset -f __bbjobs_load_env",
+    "",
+  ].join("\n");
 }
 
 interface JobMeta {
@@ -294,10 +336,42 @@ export class JobManager {
     return this.systemd;
   }
 
-  /** start() plus warnings about the machine that the caller should see. */
-  async startWithChecks(input: StartInput): Promise<Job & { warnings: string[] }> {
-    const job = await this.start(input);
+  /**
+   * start() plus warnings about the machine that the caller should see. With
+   * a key, a job already started under that key is returned instead
+   * (`reused`), so a retry after a lost answer never starts a second job.
+   */
+  async startWithChecks(
+    input: StartInput,
+  ): Promise<Job & { warnings: string[]; reused: boolean }> {
+    let job: Job;
+    let reused = false;
+    if (input.key) {
+      const claim = await this.claimKey(input.key);
+      if ("existing" in claim) {
+        job = await this.get(claim.existing);
+        reused = true;
+      } else {
+        try {
+          job = await this.start(input);
+        } catch (error) {
+          await rm(claim.file, { force: true });
+          throw error;
+        }
+        await writeFile(claim.file, job.id, { mode: 0o600 });
+      }
+    } else {
+      job = await this.start(input);
+    }
     const warnings: string[] = [];
+    if (!reused && input.envFile) {
+      const mode = (await stat(input.envFile)).mode & 0o077;
+      if (mode) {
+        warnings.push(
+          `--env-file ${input.envFile} is readable by other users (mode ${((await stat(input.envFile)).mode & 0o777).toString(8)}); chmod 600 it`,
+        );
+      }
+    }
     if (job.mode === "systemd") {
       const linger = await lingerEnabled();
       if (linger === false) {
@@ -307,7 +381,46 @@ export class JobManager {
         );
       }
     }
-    return { ...job, warnings };
+    return { ...job, warnings, reused };
+  }
+
+  /**
+   * Claim an idempotency key: the first caller creates keys/<sha256> (O_EXCL)
+   * and later writes the job id into it; callers that find the file get the
+   * job id, waiting briefly while the first start is still running.
+   */
+  private async claimKey(key: string): Promise<{ file: string } | { existing: string }> {
+    const keysDir = path.join(this.root, "keys");
+    await mkdir(keysDir, { recursive: true, mode: 0o700 });
+    const file = path.join(keysDir, createHash("sha256").update(key).digest("hex"));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const handle = await open(file, "wx", 0o600);
+        await handle.close();
+        return { file };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      const deadline = Date.now() + 15000;
+      for (;;) {
+        const id = (await readFile(file, "utf8").catch(() => null))?.trim();
+        if (id === undefined) break; // removed meanwhile: claim again
+        if (id) {
+          if (existsSync(path.join(this.dir(id), "meta.json"))) return { existing: id };
+          await rm(file, { force: true }); // that job was pruned: the key is free
+          break;
+        }
+        // Empty: another start with this key is in progress.
+        const claimed = await stat(file).catch(() => null);
+        const age = claimed ? Date.now() - claimed.mtimeMs : 0;
+        if (Date.now() > deadline || age > 60000) {
+          await rm(file, { force: true }); // a start that died half-way
+          break;
+        }
+        await sleep(100);
+      }
+    }
+    throw new Error(`could not claim --key ${key}; try again`);
   }
 
   async start(input: StartInput): Promise<Job> {
@@ -320,6 +433,31 @@ export class JobManager {
     const cwdStat = await stat(input.cwd).catch(() => null);
     if (!cwdStat?.isDirectory()) {
       throw new Error(`working directory does not exist: ${input.cwd}`);
+    }
+    if (input.envFile) {
+      if (!path.isAbsolute(input.envFile)) {
+        throw new Error(`--env-file must be an absolute path on the job's machine: ${input.envFile}`);
+      }
+      const envStat = await stat(input.envFile).catch(() => null);
+      if (!envStat?.isFile()) throw new Error(`--env-file not found: ${input.envFile}`);
+    }
+    if (input.memoryMax && !MEMORY_MAX_PATTERN.test(input.memoryMax)) {
+      throw new Error(`bad --memory-max ${input.memoryMax}: use bytes with K/M/G/T, or a percentage`);
+    }
+    if (input.cpuQuota && !CPU_QUOTA_PATTERN.test(input.cpuQuota)) {
+      throw new Error(`bad --cpu-quota ${input.cpuQuota}: use a percentage such as 150%`);
+    }
+    const limits = [
+      input.memoryMax ? `MemoryMax=${input.memoryMax}` : null,
+      input.cpuQuota ? `CPUQuota=${input.cpuQuota}` : null,
+      input.tasksMax ? `TasksMax=${input.tasksMax}` : null,
+    ].filter((l): l is string => l !== null);
+    if ((limits.length || input.requireSystemd) && !(await this.hasSystemd())) {
+      throw new Error(
+        limits.length
+          ? "--memory-max, --cpu-quota and --tasks-max need user systemd, which this machine does not have; the job was not started"
+          : "user systemd is not available on this machine and --require-systemd forbids detached mode; the job was not started",
+      );
     }
     const id = `${slug(input.name)}-${randomBytes(3).toString("hex")}`;
     const logMaxBytes = input.logMaxBytes ?? DEFAULT_LOG_MAX_BYTES;
@@ -337,7 +475,7 @@ export class JobManager {
     if (exports) await writeFile(envFile, exports, { mode: 0o600 });
     await writeFile(
       path.join(dir, "command.sh"),
-      `${ENV_PRELUDE}${input.command}\n`,
+      `${ENV_PRELUDE}${input.envFile ? envFileLoader(input.envFile) : ""}${input.command}\n`,
       { mode: 0o600 },
     );
     await writeFile(path.join(dir, "cwd"), input.cwd);
@@ -370,6 +508,7 @@ export class JobManager {
         "--quiet",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=15",
+        ...limits.map((l) => `--property=${l}`),
         ...Object.entries(inherited).map(([k, v]) => `--setenv=${k}=${v}`),
         "--",
         "/bin/bash",

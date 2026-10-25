@@ -589,6 +589,35 @@ export default async function plugin(bb: BbPluginApi) {
               type: "string",
               description: "Thread to notify instead of the calling one; implies --notify",
             },
+            key: {
+              type: "string",
+              description:
+                "Idempotency key (printable ASCII, max 200): if a job was already started with this key on the machine, return it instead of starting another",
+              aliases: ["idempotency-key"],
+            },
+            "env-file": {
+              type: "string",
+              description:
+                "Absolute path of a KEY=VALUE file on the job's machine; the job reads it at start, so values never pass through bb (chmod 600 it)",
+            },
+            "memory-max": {
+              type: "string",
+              description: "systemd MemoryMax for the job, e.g. 2G or 30% (needs user systemd)",
+            },
+            "cpu-quota": {
+              type: "string",
+              description: "systemd CPUQuota, e.g. 150% = one and a half cores (needs user systemd)",
+            },
+            "tasks-max": {
+              type: "integer",
+              min: 1,
+              max: 1_000_000,
+              description: "systemd TasksMax: most processes and threads the job may have (needs user systemd)",
+            },
+            "require-systemd": {
+              type: "boolean",
+              description: "Fail instead of starting a detached job when the machine has no user systemd",
+            },
             machine: machineOption,
             json: jsonOption,
           },
@@ -656,6 +685,12 @@ export default async function plugin(bb: BbPluginApi) {
                 logMaxBytes: input.options["log-max"] * 1024 * 1024,
                 threadId: ctx.threadId ?? null,
                 bbEnv: await threadEnv(ctx.threadId, hostId),
+                key: input.options.key ?? null,
+                envFile: input.options["env-file"] ?? null,
+                memoryMax: input.options["memory-max"] ?? null,
+                cpuQuota: input.options["cpu-quota"] ?? null,
+                tasksMax: input.options["tasks-max"] ?? null,
+                requireSystemd: input.options["require-systemd"],
               },
               hostId,
               ctx.signal,
@@ -665,7 +700,10 @@ export default async function plugin(bb: BbPluginApi) {
                 all[job.id] = { hostId, threadId: notifyThread, addedAt: new Date().toISOString() };
               });
             }
-            const warnings = job.warnings.map((w) => `Warning: ${w}\n`).join("");
+            const warnings =
+              (job.reused
+                ? `Reused job ${job.id}: a job with --key ${input.options.key} was already started; nothing new was started\n`
+                : "") + job.warnings.map((w) => `Warning: ${w}\n`).join("");
             const notifyLine = notifyThread
               ? `Notify: thread ${notifyThread} gets a message when the job ends\n`
               : "";
@@ -682,7 +720,7 @@ export default async function plugin(bb: BbPluginApi) {
                 const now = await call("get", { id: job.id }, hostId, ctx.signal);
                 return {
                   exitCode: result.exitCode,
-                  stdout: JSON.stringify({ ...now, warnings: job.warnings }, null, 2),
+                  stdout: JSON.stringify({ ...now, warnings: job.warnings, reused: job.reused }, null, 2),
                 };
               }
               return { ...result, stdout: warnings + notifyLine + result.stdout };
@@ -699,7 +737,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (input.options.json) {
               return {
                 exitCode: 0,
-                stdout: JSON.stringify({ ...now, warnings: job.warnings }, null, 2),
+                stdout: JSON.stringify({ ...now, warnings: job.warnings, reused: job.reused }, null, 2),
               };
             }
             return {
