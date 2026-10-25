@@ -115,6 +115,12 @@ export const hostContract = defineRpcContract({
       })
       .strict(),
   },
+  releaseKey: {
+    input: z.object({ key: z.string().regex(/^[\x21-\x7e]{1,200}$/) }).strict(),
+    output: z
+      .object({ released: z.boolean(), state: z.string(), backup: z.string().nullable() })
+      .strict(),
+  },
   prune: {
     input: z
       .object({

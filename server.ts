@@ -719,9 +719,16 @@ export default async function plugin(bb: BbPluginApi) {
               ctx.signal,
             ).catch((error: unknown) => {
               // The machine refused the job (missing cwd or env file, no
-              // systemd for limits): a usage error, not a plugin failure.
-              throw new PluginCliError(error instanceof Error ? error.message : String(error), {
-                code: "start_refused",
+              // systemd for limits, a key conflict): a usage error, not a
+              // plugin failure. key_* errors keep their code.
+              const message = error instanceof Error ? error.message : String(error);
+              const coded = message.match(/^(key_[a-z]+): ([\s\S]*)$/);
+              throw new PluginCliError(coded ? coded[2]! : message, {
+                code: coded ? coded[1]! : "start_refused",
+                hint:
+                  coded?.[1] === "key_unknown" || coded?.[1] === "key_busy"
+                    ? `After checking, free the key with: bb jobs release-key '${input.options.key}'`
+                    : undefined,
               });
             });
             if (notifyThread) {
@@ -1046,6 +1053,24 @@ export default async function plugin(bb: BbPluginApi) {
                   result.pruned.map((p) => `  ${p.id}`).join("\n") +
                   "\n"
                 : "Nothing to prune.\n",
+            };
+          },
+        }),
+        "release-key": cliCommand({
+          summary: "Free an idempotency key after checking a key_unknown or key_busy state",
+          description:
+            "Renames the key's claim file (keeps a .bak copy). Use only after checking that the earlier start with this key did not run, or that you accept running the command again.",
+          positionals: [{ name: "key", description: "The --key value", required: true }],
+          options: { machine: machineOption, json: jsonOption },
+          async run(input, ctx) {
+            const hostId = await resolveHost(input.options.machine, ctx.threadId);
+            const result = await call("releaseKey", { key: input.positionals.key }, hostId, ctx.signal);
+            if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(result, null, 2) };
+            return {
+              exitCode: 0,
+              stdout: result.released
+                ? `Released --key ${input.positionals.key} (was ${result.state}); claim kept as ${result.backup}\n`
+                : `No claim for --key ${input.positionals.key} on this machine\n`,
             };
           },
         }),

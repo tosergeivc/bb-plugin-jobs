@@ -70,6 +70,66 @@ export interface StartInput {
   tasksMax?: number | null;
   /** Fail instead of falling back to detached mode. */
   requireSystemd?: boolean;
+  /** Internal: sha256 of the key, marked in the job directory. */
+  keyHash?: string;
+}
+
+export function keyHash(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+/** What a repeated start with the same key must match. */
+export function requestFingerprint(input: StartInput): string {
+  const env = Object.entries(input.env ?? {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${createHash("sha256").update(v).digest("hex")}`);
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        command: input.command,
+        cwd: input.cwd,
+        env,
+        envFile: input.envFile ?? null,
+        timeoutSec: input.timeoutSec ?? null,
+        memoryMax: input.memoryMax ?? null,
+        cpuQuota: input.cpuQuota ?? null,
+        tasksMax: input.tasksMax ?? null,
+        requireSystemd: input.requireSystemd ?? false,
+      }),
+    )
+    .digest("hex");
+}
+
+type Claim = {
+  state: "pending" | "done";
+  pid: number;
+  jobId: string | null;
+  fingerprint: string | null;
+};
+
+async function readClaim(file: string): Promise<Claim | null> {
+  const raw = await readFile(file, "utf8").catch(() => null);
+  if (raw === null) return null;
+  const text = raw.trim();
+  if (!text) return { state: "pending", pid: -1, jobId: null, fingerprint: null };
+  if (!text.startsWith("{")) return { state: "done", pid: -1, jobId: text, fingerprint: null }; // 0.5.0/0.5.1
+  return JSON.parse(text) as Claim;
+}
+
+async function writeClaim(file: string, claim: Claim): Promise<void> {
+  const tmp = `${file}.tmp-${process.pid}`;
+  await writeFile(tmp, JSON.stringify(claim), { mode: 0o600 });
+  await rename(tmp, file);
+}
+
+function pidAlive(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 export const MEMORY_MAX_PATTERN = /^(\d+[KMGT]?|\d{1,3}%)$/i;
@@ -118,6 +178,8 @@ interface JobMeta {
   threadId: string | null;
   /** 2 for jobs started by 0.2.0+ (process ownership by launch lines). */
   format?: number;
+  /** requestFingerprint of a keyed start (0.5.2+). */
+  keyFingerprint?: string;
 }
 
 export type LogsResult = {
@@ -347,31 +409,22 @@ export class JobManager {
     let job: Job;
     let reused = false;
     if (input.key) {
-      const claim = await this.claimKey(input.key);
-      if ("existing" in claim) {
-        job = await this.get(claim.existing);
-        reused = true;
-      } else {
-        try {
-          job = await this.start(input);
-        } catch (error) {
-          await rm(claim.file, { force: true });
-          throw error;
-        }
-        await writeFile(claim.file, job.id, { mode: 0o600 });
+      // Starts with one key run one after another in this process; there is
+      // no timeout after which a pending start is assumed dead.
+      const hash = keyHash(input.key);
+      const previous = this.keyLocks.get(hash) ?? Promise.resolve();
+      const mine = previous.then(() => this.startKeyed(input, hash));
+      const tail = mine.catch(() => undefined);
+      this.keyLocks.set(hash, tail);
+      try {
+        ({ job, reused } = await mine);
+      } finally {
+        if (this.keyLocks.get(hash) === tail) this.keyLocks.delete(hash);
       }
     } else {
       job = await this.start(input);
     }
     const warnings: string[] = [];
-    if (!reused && input.envFile) {
-      const mode = (await stat(input.envFile)).mode & 0o077;
-      if (mode) {
-        warnings.push(
-          `--env-file ${input.envFile} is readable by other users (mode ${((await stat(input.envFile)).mode & 0o777).toString(8)}); chmod 600 it`,
-        );
-      }
-    }
     if (job.mode === "systemd") {
       const linger = await lingerEnabled();
       if (linger === false) {
@@ -384,43 +437,127 @@ export class JobManager {
     return { ...job, warnings, reused };
   }
 
+  private readonly keyLocks = new Map<string, Promise<unknown>>();
+
+  private claimPath(hash: string): string {
+    return path.join(this.root, "keys", hash);
+  }
+
   /**
-   * Claim an idempotency key: the first caller creates keys/<sha256> (O_EXCL)
-   * and later writes the job id into it; callers that find the file get the
-   * job id, waiting briefly while the first start is still running.
+   * One keyed start, run while holding this process's lock for the key.
+   *
+   * keys/<sha256 of key> holds {state, pid, jobId, fingerprint}:
+   * - none: claim it ("pending" with our pid), start, then record "done".
+   * - "done" and the job still exists: reuse it if the request matches
+   *   (key_conflict otherwise); a pruned job frees the key.
+   * - "pending" by another live process: key_busy (never taken over).
+   * - "pending" by a dead process, or by this process outside the lock (a
+   *   start that failed half-way): look for the job directory marked with
+   *   the key. None: nothing was started, claim again. With meta.json: adopt
+   *   it. Without meta.json: key_unknown; `release-key` after inspection.
    */
-  private async claimKey(key: string): Promise<{ file: string } | { existing: string }> {
-    const keysDir = path.join(this.root, "keys");
-    await mkdir(keysDir, { recursive: true, mode: 0o700 });
-    const file = path.join(keysDir, createHash("sha256").update(key).digest("hex"));
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const handle = await open(file, "wx", 0o600);
-        await handle.close();
-        return { file };
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-      const deadline = Date.now() + 15000;
-      for (;;) {
-        const id = (await readFile(file, "utf8").catch(() => null))?.trim();
-        if (id === undefined) break; // removed meanwhile: claim again
-        if (id) {
-          if (existsSync(path.join(this.dir(id), "meta.json"))) return { existing: id };
-          await rm(file, { force: true }); // that job was pruned: the key is free
-          break;
+  private async startKeyed(
+    input: StartInput,
+    hash: string,
+  ): Promise<{ job: Job; reused: boolean }> {
+    await mkdir(path.join(this.root, "keys"), { recursive: true, mode: 0o700 });
+    const file = this.claimPath(hash);
+    const fingerprint = requestFingerprint(input);
+    const claim = await readClaim(file);
+    if (claim) {
+      if (claim.state === "done" && claim.jobId) {
+        if (existsSync(path.join(this.dir(claim.jobId), "meta.json"))) {
+          return { job: await this.reuse(claim.jobId, claim.fingerprint, fingerprint, input.key!), reused: true };
         }
-        // Empty: another start with this key is in progress.
-        const claimed = await stat(file).catch(() => null);
-        const age = claimed ? Date.now() - claimed.mtimeMs : 0;
-        if (Date.now() > deadline || age > 60000) {
-          await rm(file, { force: true }); // a start that died half-way
-          break;
+        // That job was pruned: the key is free again.
+      } else if (claim.state === "pending") {
+        if (claim.pid !== process.pid && pidAlive(claim.pid)) {
+          throw new Error(
+            `key_busy: a start with --key ${input.key} is in progress in process ${claim.pid}; try again later`,
+          );
         }
-        await sleep(100);
+        const found = await this.findKeyedJob(hash);
+        if (found?.hasMeta) {
+          await writeClaim(file, { state: "done", pid: process.pid, jobId: found.id, fingerprint: claim.fingerprint });
+          return { job: await this.reuse(found.id, claim.fingerprint, fingerprint, input.key!), reused: true };
+        }
+        if (found) {
+          throw new Error(
+            `key_unknown: a start with --key ${input.key} stopped half-way and left ${this.dir(found.id)} without meta.json; check whether its command ran, then run bb jobs release-key`,
+          );
+        }
+        // No job directory: that start never got as far as running anything.
       }
     }
-    throw new Error(`could not claim --key ${key}; try again`);
+    const pending: Claim = { state: "pending", pid: process.pid, jobId: null, fingerprint };
+    if (claim) {
+      await writeClaim(file, pending); // checked above: free to take
+    } else {
+      // No claim yet: create it atomically, in case another process races us.
+      try {
+        const handle = await open(file, "wx", 0o600);
+        await handle.writeFile(JSON.stringify(pending));
+        await handle.close();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        throw new Error(
+          `key_busy: another process claimed --key ${input.key} at the same moment; try again`,
+        );
+      }
+    }
+    let job: Job;
+    try {
+      job = await this.start({ ...input, keyHash: hash });
+    } catch (error) {
+      // If start() created a job directory, the claim stays pending and the
+      // next attempt reconciles it from that directory.
+      if (!(await this.findKeyedJob(hash))) await rm(file, { force: true });
+      throw error;
+    }
+    await writeClaim(file, { state: "done", pid: process.pid, jobId: job.id, fingerprint });
+    return { job, reused: false };
+  }
+
+  private async reuse(
+    jobId: string,
+    recorded: string | null,
+    fingerprint: string,
+    key: string,
+  ): Promise<Job> {
+    // The job's own record wins over the claim file.
+    const meta = await this.readMeta(jobId);
+    const expected = meta.keyFingerprint ?? recorded;
+    if (expected && expected !== fingerprint) {
+      throw new Error(
+        `key_conflict: --key ${key} was used for a different request (command, directory, environment, env file, limits or timeout) by job ${jobId}; use a new key`,
+      );
+    }
+    return this.get(jobId);
+  }
+
+  /** The job directory whose `key` marker holds this key hash, if any. */
+  private async findKeyedJob(hash: string): Promise<{ id: string; hasMeta: boolean } | null> {
+    for (const id of await readdir(this.jobsDir()).catch(() => [] as string[])) {
+      const marker = await readFile(path.join(this.dir(id), "key"), "utf8").catch(() => null);
+      if (marker?.trim() === hash) {
+        return { id, hasMeta: existsSync(path.join(this.dir(id), "meta.json")) };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Free a key after a human checked a key_unknown/key_busy state: the claim
+   * file is renamed, never deleted.
+   */
+  async releaseKey(key: string): Promise<{ released: boolean; state: string; backup: string | null }> {
+    const file = this.claimPath(keyHash(key));
+    const claim = await readClaim(file);
+    if (!claim) return { released: false, state: "none", backup: null };
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+    const backup = `${file}.bak-${stamp}`;
+    await rename(file, backup);
+    return { released: true, state: claim.state, backup };
   }
 
   async start(input: StartInput): Promise<Job> {
@@ -440,6 +577,11 @@ export class JobManager {
       }
       const envStat = await stat(input.envFile).catch(() => null);
       if (!envStat?.isFile()) throw new Error(`--env-file not found: ${input.envFile}`);
+      if (envStat.mode & 0o077) {
+        throw new Error(
+          `--env-file ${input.envFile} is readable or writable by other users (mode ${(envStat.mode & 0o777).toString(8)}); run chmod 600 on it. The job was not started`,
+        );
+      }
     }
     if (input.memoryMax && !MEMORY_MAX_PATTERN.test(input.memoryMax)) {
       throw new Error(`bad --memory-max ${input.memoryMax}: use bytes with K/M/G/T, or a percentage`);
@@ -463,6 +605,9 @@ export class JobManager {
     const logMaxBytes = input.logMaxBytes ?? DEFAULT_LOG_MAX_BYTES;
     const dir = this.dir(id);
     await mkdir(dir, { mode: 0o700 });
+    // Written before anything can run, so a keyed start that dies half-way
+    // can be found again (see startKeyed).
+    if (input.keyHash) await writeFile(path.join(dir, "key"), input.keyHash, { mode: 0o600 });
     // Per-job copies: bash reads a script while it runs, so a shared runner
     // rewritten by a later start could corrupt jobs already running.
     const runner = path.join(dir, "runner.sh");
@@ -565,6 +710,7 @@ export class JobManager {
       logMaxBytes,
       threadId: input.threadId,
       format: 2,
+      ...(input.keyHash ? { keyFingerprint: requestFingerprint(input) } : {}),
     };
     await writeFile(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2), {
       mode: 0o600,

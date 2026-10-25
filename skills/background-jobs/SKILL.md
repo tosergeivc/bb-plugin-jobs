@@ -43,10 +43,13 @@ All commands accept `--machine <id|name>` to target another machine and
 - For a deploy or any command that must not run twice, pass `--key <stable id>`
   (e.g. `--key deploy:<commit>`): if your first `start` answer was lost, the
   same command with the same key returns the existing job instead of a second
-  run.
+  run. A different command with a used key fails with `key_conflict` (pick a
+  new key). `key_busy` or `key_unknown` means an earlier start with that key
+  may still be running or stopped half-way: tell the user, check
+  `bb jobs list --all`, and only after that run `bb jobs release-key <key>`.
 - Secrets: put them in a chmod-600 `KEY=VALUE` file on the job's machine and
-  pass `--env-file /absolute/path`; never type a secret in the command or in
-  `--env`.
+  pass `--env-file /absolute/path` (a file other users can read is refused);
+  never put a secret in the command or in `--env`.
 - For critical work add `--require-systemd` (and limits such as
   `--memory-max 2G`), so the job never silently runs detached or unbounded.
 - `ssh host cmd` as a job: stopping the job ends the local ssh client, not
@@ -54,10 +57,8 @@ All commands accept `--machine <id|name>` to target another machine and
 - Exit 0, a ready check or a notice mean the command ended; check the actual
   result (artifact, health endpoint, version) before saying a deploy worked.
 - The job inherits only PATH, HOME, USER, SHELL, LANG, TZ and SSH_AUTH_SOCK
-  from the machine; pass anything else with `--env`. `--env` values are not
-  kept on disk after the job starts. Pass a secret as `--env TOKEN="$TOKEN"`,
-  never literally, and never inside the command: the command is stored and
-  shown by `bb jobs status`.
+  from the machine; pass other non-secret settings with `--env`. The command
+  itself is stored and shown by `bb jobs status`.
 - After `start`, read the printed first output. For a deploy or any job you
   do not need to watch, add `--notify`: the thread gets a `[bb jobs]` message
   with the result and last output when the job ends, so you can end your turn

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { JobManager, cleanTerminalText, isLaunchLine } from "../jobs-core.ts";
+import { JobManager, cleanTerminalText, isLaunchLine, keyHash } from "../jobs-core.ts";
 
 function grepDir(dir: string, needle: string): string[] {
   return readdirSync(dir).filter((f) => readFileSync(path.join(dir, f), "utf8").includes(needle));
@@ -406,6 +406,73 @@ for (const forceDetached of [false, true]) {
       assert.equal(ok.reused, false);
     });
 
+    it("--key claims: never taken over by time, reconciled from the job directory, bound to the request", async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "bbjobs-claim-"));
+      const keyed = new JobManager(root, { forceDetached });
+      const req = { ...base, name: "claim", command: "sleep 20" };
+      const claimFile = (key: string) => path.join(root, "keys", keyHash(key));
+      const writeClaim = (key: string, claim: object) => {
+        mkdirSync(path.join(root, "keys"), { recursive: true });
+        writeFileSync(claimFile(key), JSON.stringify(claim));
+      };
+      const deadPid = () => {
+        const child = spawn("true");
+        return new Promise<number>((resolve) => child.on("exit", () => resolve(child.pid!)));
+      };
+
+      // A pending claim of another live process is never taken over, however old.
+      const owner = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+      owner.unref();
+      writeClaim("busy", { state: "pending", pid: owner.pid, jobId: null, fingerprint: null });
+      const old = new Date(Date.now() - 2 * 3600 * 1000);
+      utimesSync(claimFile("busy"), old, old);
+      await assert.rejects(keyed.startWithChecks({ ...req, key: "busy" }), /key_busy/);
+      assert.ok(existsSync(claimFile("busy")), "claim kept");
+      assert.equal((await keyed.list(50)).length, 0, "nothing started");
+      process.kill(owner.pid!, "SIGKILL");
+
+      // Dead owner and no job directory: nothing ran, the key is claimed again.
+      writeClaim("dead-none", { state: "pending", pid: await deadPid(), jobId: null, fingerprint: null });
+      const fresh = await keyed.startWithChecks({ ...req, key: "dead-none" });
+      assert.equal(fresh.reused, false);
+
+      // Dead owner and a marked job directory without meta.json: unknown, refused.
+      mkdirSync(path.join(root, "jobs", "half-000000"), { recursive: true });
+      writeFileSync(path.join(root, "jobs", "half-000000", "key"), keyHash("half"));
+      writeClaim("half", { state: "pending", pid: await deadPid(), jobId: null, fingerprint: null });
+      await assert.rejects(keyed.startWithChecks({ ...req, key: "half" }), /key_unknown/);
+      const released = await keyed.releaseKey("half");
+      assert.equal(released.released, true);
+      assert.ok(released.backup && existsSync(released.backup), "claim renamed, not deleted");
+      assert.equal((await keyed.startWithChecks({ ...req, key: "half" })).reused, false);
+
+      // Dead owner and a complete job: adopted, not started again.
+      const done = await keyed.startWithChecks({ ...req, key: "adopt" });
+      writeClaim("adopt", { state: "pending", pid: await deadPid(), jobId: null, fingerprint: null });
+      const adopted = await keyed.startWithChecks({ ...req, key: "adopt" });
+      assert.equal(adopted.id, done.id);
+      assert.equal(adopted.reused, true);
+
+      // The same key for a different request is refused.
+      await assert.rejects(keyed.startWithChecks({ ...req, key: "adopt", command: "sleep 21" }), /key_conflict/);
+
+      for (const j of await keyed.list(50)) await keyed.stop(j.id);
+    });
+
+    it("--key: a slow first start in this process keeps the key; the second caller waits for it", async () => {
+      class Slow extends JobManager {
+        override async start(input: Parameters<JobManager["start"]>[0]) {
+          await sleep(1500);
+          return super.start(input);
+        }
+      }
+      const slow = new Slow(mkdtempSync(path.join(tmpdir(), "bbjobs-slow-")), { forceDetached });
+      const req = { ...base, name: "slow", command: "true", key: "slow-key" };
+      const [a, b] = await Promise.all([slow.startWithChecks(req), slow.startWithChecks(req)]);
+      assert.equal(a.id, b.id);
+      assert.equal([a, b].filter((j) => j.reused).length, 1);
+    });
+
     it("--env-file: values reach the command without being copied into the job directory", async () => {
       const envPath = path.join(work, "secrets.env");
       writeFileSync(envPath, "# deploy secrets\nexport TOKEN=sentinel-7f3a\nNAME=\"two words\"\nbad-name=x\n", { mode: 0o600 });
@@ -424,8 +491,10 @@ for (const forceDetached of [false, true]) {
       await assert.rejects(jobs.startWithChecks({ ...base, name: "x", command: "true", envFile: path.join(work, "missing.env") }), /--env-file not found/);
       await assert.rejects(jobs.startWithChecks({ ...base, name: "x", command: "true", envFile: "relative.env" }), /absolute path/);
       writeFileSync(path.join(work, "open.env"), "A=1\n", { mode: 0o644 });
-      const open = await jobs.startWithChecks({ ...base, name: "open", command: "true", envFile: path.join(work, "open.env") });
-      assert.match(open.warnings.join(" "), /readable by other users/);
+      await assert.rejects(
+        jobs.startWithChecks({ ...base, name: "open", command: "true", envFile: path.join(work, "open.env") }),
+        /readable or writable by other users \(mode 644\).*not started/,
+      );
     });
 
     it("resource limits and --require-systemd apply in systemd mode and refuse otherwise", async () => {

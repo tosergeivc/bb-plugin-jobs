@@ -117,7 +117,11 @@ function setup() {
             logPath: `/data/jobs/${id}/output.log`, output: "",
           };
           if (input.key && keys.has(String(input.key))) {
-            return { ...publicJob(jobs.get(keys.get(String(input.key))!)!), warnings: [], reused: true };
+            const existing = jobs.get(keys.get(String(input.key))!)!;
+            if (existing.command !== input.command) {
+              throw new Error(`key_conflict: --key ${String(input.key)} was used for a different request`);
+            }
+            return { ...publicJob(existing), warnings: [], reused: true };
           }
           jobs.set(id, job);
           if (input.key) keys.set(String(input.key), id);
@@ -135,6 +139,10 @@ function setup() {
           const job = need(input.id);
           return { job: publicJob(job), text: job.output, truncated: false, cursor: job.output.length, skippedBytes: 0 };
         }
+        case "releaseKey":
+          return keys.delete(String(input.key))
+            ? { released: true, state: "done", backup: "/data/keys/x.bak" }
+            : { released: false, state: "none", backup: null };
         case "stop": {
           const job = need(input.id);
           if (job.state === "running") job.state = "stopped";
@@ -338,6 +346,19 @@ describe("bb jobs CLI", () => {
       assert.doesNotMatch(result.stderr, /failed:/, `${args.join(" ")}: ${result.stderr}`);
     }
     assert.equal(t.jobs.size, 0, "nothing started");
+  });
+
+  it("reports key conflicts with their code, and release-key frees a key", async () => {
+    const t = await boot();
+    await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "k1", "--", "true"], { threadId: THREAD });
+    const conflict = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "k1", "--json", "--", "false"], { threadId: THREAD });
+    assert.equal(conflict.exitCode, 1);
+    assert.equal(JSON.parse(conflict.stdout).error.code, "key_conflict");
+    const release = await t.harness.behavior.runCli(["release-key", "k1"], { threadId: THREAD });
+    assert.match(release.stdout, /^Released --key k1/);
+    const again = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "k1", "--", "false"], { threadId: THREAD });
+    assert.equal(again.exitCode, 0, again.stderr);
+    assert.equal(t.jobs.size, 2);
   });
 
   it("rejects --notify outside a thread with a hint", async () => {
