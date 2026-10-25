@@ -39,7 +39,11 @@ All commands accept `--machine <id|name>` to target another machine and
 - Quote the whole command as one token when it uses pipes, `&&`, `;` or
   redirects: `bb jobs start --name deploy -- './deploy.sh prod 2>&1 | tee deploy.txt'`.
   Several tokens are quoted one by one: `bb jobs start -- npm run dev`.
-- The job gets no stdin. Pass answers with flags or env, never prompts.
+- The job gets no stdin and no terminal. Pass answers with flags or env, never
+  prompts: `sudo`, ssh passwords, unknown host keys, git credential prompts and
+  `[y/N]` questions fail at once. `NEEDS INPUT:` in `start`/`wait` output names
+  the reason; tell the owner, do not retry the same command. Steps only the owner
+  can do belong in the questions you ask before the work (skill `task-preflight`).
 - For a deploy or any command that must not run twice, pass `--key <stable id>`
   (e.g. `--key deploy:<commit>`): if your first `start` answer was lost, the
   same command with the same key returns the existing job instead of a second

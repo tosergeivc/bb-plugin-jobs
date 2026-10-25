@@ -1441,6 +1441,47 @@ function legacyGroupAlive(pgid: number): boolean {
   }
 }
 
+// A job has no terminal and reads stdin from /dev/null, so a prompt does not
+// wait: the program fails at once. These are the failures that mean "this
+// needed someone to type something", with what to do instead.
+const INPUT_PATTERNS: [RegExp, string][] = [
+  [
+    /^sudo: |^\[sudo\] password|a terminal is required to read the password|no tty present/m,
+    "sudo wanted a password or refused; a job cannot type one. Ask the owner to run that step, or to allow it without a password (sudoers NOPASSWD)",
+  ],
+  [
+    /Host key verification failed|Are you sure you want to continue connecting/,
+    "ssh does not know the host key; a job cannot confirm it. Add the key first (ssh-keyscan HOST >> ~/.ssh/known_hosts after checking it) or ask the owner",
+  ],
+  [
+    /Permission denied \((publickey|password|keyboard-interactive)|Enter passphrase for key|'s password: *$/m,
+    "ssh needed a password or key passphrase; use a key without a passphrase or ssh-agent (SSH_AUTH_SOCK), or ask the owner",
+  ],
+  [
+    /could not read (Username|Password) for|terminal prompts disabled/,
+    "git asked for credentials; configure a credential helper or token for this machine, or ask the owner",
+  ],
+  [
+    /EOFError: EOF when reading a line/,
+    "a Python input() prompt got no answer; pass the answer as a flag, argument or environment variable",
+  ],
+  [
+    /\[y\/N\]|\[Y\/n\]|\(y\/n\)|\(yes\/no\)|Do you want to continue\?|Proceed\?/i,
+    "the command asked for a confirmation; pass its non-interactive flag (-y, --yes, --non-interactive, DEBIAN_FRONTEND=noninteractive) or ask the owner",
+  ],
+];
+
+/**
+ * Why a finished job probably needed input, from the end of its output, or
+ * null. Look at the last lines only: an old prompt that was answered by a
+ * flag is not the reason a job ended.
+ */
+export function inputHint(output: string): string | null {
+  const tail = output.split("\n").slice(-30).join("\n");
+  for (const [pattern, hint] of INPUT_PATTERNS) if (pattern.test(tail)) return hint;
+  return null;
+}
+
 // CSI (colours, cursor moves), OSC (titles, hyperlinks) and other ESC sequences.
 const ANSI_PATTERN =
   /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;

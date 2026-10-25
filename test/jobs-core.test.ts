@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { JobManager, cleanTerminalText, isLaunchLine, keyHash } from "../jobs-core.ts";
+import { JobManager, cleanTerminalText, inputHint, isLaunchLine, keyHash } from "../jobs-core.ts";
 
 function grepDir(dir: string, needle: string): string[] {
   return readdirSync(dir).filter((f) => readFileSync(path.join(dir, f), "utf8").includes(needle));
@@ -726,5 +726,25 @@ describe("prune scope (0.5.4)", () => {
     assert.deepEqual((await jobs.list(50)).map((j) => j.id).sort(), [none.id, theirs.id].sort(), "other jobs stay");
     const all = await jobs.prune(0, { remove: false, dryRun: false, threadId: null });
     assert.deepEqual(all.pruned.map((p) => p.id).sort(), [none.id, theirs.id].sort());
+  });
+});
+
+describe("inputHint", () => {
+  it("names the input a failed job needed, from real job output", () => {
+    // As seen on bb01 for jobs without a terminal (2026-10-25).
+    assert.match(inputHint("sudo: I'm sorry bb. I'm afraid I can't do that\n[jobs] exited 1 at x\n")!, /^sudo/);
+    assert.match(inputHint("sudo: a terminal is required to read the password; either use the -S option\n")!, /^sudo/);
+    assert.match(inputHint("Host key verification failed.\n")!, /^ssh does not know the host key/);
+    assert.match(inputHint("deploy@10.0.0.5: Permission denied (publickey,password).\n")!, /^ssh needed a password/);
+    assert.match(inputHint("fatal: could not read Username for 'https://github.com': No such device or address\n")!, /^git asked/);
+    assert.match(inputHint('Password: Traceback (most recent call last):\n  File "<string>", line 1\nEOFError: EOF when reading a line\n')!, /Python input/);
+    assert.match(inputHint("After this operation, 5 MB will be used.\nDo you want to continue? [Y/n] Abort.\n")!, /confirmation/);
+  });
+
+  it("stays quiet for other failures and for prompts long before the end", () => {
+    assert.equal(inputHint("Error: config.yml not found\n"), null);
+    assert.equal(inputHint("npm ERR! code ELIFECYCLE\n"), null);
+    const early = "Continue? [y/N] y\n" + Array.from({ length: 40 }, (_, i) => `step ${i}\n`).join("") + "Error: build failed\n";
+    assert.equal(inputHint(early), null);
   });
 });

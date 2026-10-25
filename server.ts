@@ -14,10 +14,20 @@ import {
   CPU_QUOTA_PATTERN,
   KEY_PATTERN,
   MEMORY_MAX_PATTERN,
+  inputHint,
   shellQuote,
 } from "./jobs-core.js";
 
 const LOG_DEFAULT_BYTES = 16 * 1024;
+const NEEDS_INPUT = "Needs input:";
+const needsInput = (section: string) => section.includes(`\n${NEEDS_INPUT} `);
+
+/** A line for CLI output when a finished job failed for lack of input. */
+function inputLine(job: Job, text: string): string {
+  if (job.state === "running" || (job.state === "exited" && job.exitCode === 0)) return "";
+  const hint = inputHint(text);
+  return hint ? `NEEDS INPUT: ${hint}\n` : "";
+}
 const LOG_MAX_BYTES = 512 * 1024;
 const READY_MAX_MS = 10 * 60 * 1000;
 const NOTIFY_KEY = "notify";
@@ -148,16 +158,20 @@ export default async function plugin(bb: BbPluginApi) {
   function noticeText(sections: string[]): string {
     const header =
       sections.length === 1 ? "[bb jobs] A job ended." : `[bb jobs] ${sections.length} jobs ended.`;
-    return [header, ...sections].join("\n\n");
+    const input = sections.some(needsInput) ? " A job stopped because it needed input that only a person can give." : "";
+    return [header + input, ...sections].join("\n\n");
   }
   async function noticeInput(sections: string[]) {
     const { notifyVisibility } = await settings.get();
+    // Input from a person (a password, a confirmation) is the owner's to
+    // give, so such a notice is shown in the chat whatever the setting says.
+    const agentOnly = notifyVisibility === "agent-only" && !sections.some(needsInput);
     return [
       {
         type: "text" as const,
         text: noticeText(sections),
         mentions: [],
-        ...(notifyVisibility === "agent-only" ? { visibility: "agent-only" as const } : {}),
+        ...(agentOnly ? { visibility: "agent-only" as const } : {}),
       },
     ];
   }
@@ -239,8 +253,10 @@ export default async function plugin(bb: BbPluginApi) {
     const ok = job.state === "exited" && job.exitCode === 0;
     if (ok) lines = lines.slice(-NOTIFY_SUCCESS_LINES);
     const output = lines.join("\n").trim();
+    const hint = ok ? null : inputHint(text);
     return [
       `${job.id} ${result}${took}: ${command}`,
+      ...(hint ? [`${NEEDS_INPUT} ${hint}`] : []),
       `Log: bb jobs logs ${job.id} --machine ${hostId} (cwd ${job.cwd})`,
       ...(output ? ["```", output, "```"] : ["(no output)"]),
     ].join("\n");
@@ -538,7 +554,7 @@ export default async function plugin(bb: BbPluginApi) {
           : `FAILED: ${result.detail}`;
     return {
       exitCode,
-      stdout: `${describe(result.job)}\n${verdict}\n--- last output ---\n${text}`,
+      stdout: `${describe(result.job)}\n${verdict}\n${inputLine(result.job, text)}--- last output ---\n${text}`,
     };
   }
 
@@ -791,6 +807,7 @@ export default async function plugin(bb: BbPluginApi) {
               stdout:
                 warnings +
                 `${describe(now)}\n` +
+                inputLine(now, text) +
                 notifyLine +
                 `Logs:  bb jobs logs ${now.id}\n` +
                 `Wait:  bb jobs wait ${now.id}\n` +
@@ -981,7 +998,7 @@ export default async function plugin(bb: BbPluginApi) {
                   : 1;
             return {
               exitCode,
-              stdout: `${describe(job)}\n--- last output ---\n${text}`,
+              stdout: `${describe(job)}\n${inputLine(job, text)}--- last output ---\n${text}`,
             };
           },
         }),

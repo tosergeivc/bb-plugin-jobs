@@ -49,7 +49,7 @@ function setup() {
   const jobs = new Map<string, FakeJob>();
   const keys = new Map<string, string>();
   const threadStatus = new Map<string, string>([[THREAD, "idle"], [OTHER, "idle"]]);
-  const sends: { threadId: string; text: string; mode: string }[] = [];
+  const sends: { threadId: string; text: string; mode: string; visibility?: string }[] = [];
   const queued = new Map<string, { id: string; updatedAt: number; text: string }[]>();
   let sendBehaviour: "ok" | "fail" = "ok";
   // What the machine does with the next start: run it, refuse it, or never answer.
@@ -76,10 +76,10 @@ function setup() {
           });
         },
         storageLocation: async () => ({ hostId: HOST, storageRootPath: "/storage" }),
-        send: async (args: { threadId: string; mode: string; input: { text?: string }[] }) => {
+        send: async (args: { threadId: string; mode: string; input: { text?: string; visibility?: string }[] }) => {
           if (sendBehaviour === "fail") throw new Error("HTTP 500: Internal server error");
           const text = textOf(args.input);
-          sends.push({ threadId: args.threadId, text, mode: args.mode });
+          sends.push({ threadId: args.threadId, text, mode: args.mode, visibility: args.input[0]?.visibility });
           if (threadStatus.get(args.threadId) !== "idle") {
             const id = `qmsg_${++counter}`;
             queued.set(args.threadId, [...(queued.get(args.threadId) ?? []), { id, updatedAt: Date.now(), text }]);
@@ -216,6 +216,21 @@ async function boot(options: { service?: boolean } = {}) {
 }
 
 describe("--notify service", () => {
+  it("shows a notice to the owner when a job failed for lack of input; other notices stay agent-only", async () => {
+    const t = await boot();
+    const plain = await t.start("plain", ["--notify"]);
+    t.end(plain, 2, "Error: config.yml not found\n");
+    await until(() => t.sends.length === 1);
+    assert.equal(t.sends[0]!.visibility, "agent-only");
+    assert.doesNotMatch(t.sends[0]!.text, /Needs input/);
+    const ssh = await t.start("ssh", ["--notify"]);
+    t.end(ssh, 255, "Host key verification failed.\n");
+    await until(() => t.sends.length === 2);
+    assert.equal(t.sends[1]!.visibility, undefined, "visible in the chat");
+    assert.match(t.sends[1]!.text, /needed input that only a person can give/);
+    assert.match(t.sends[1]!.text, new RegExp(`${ssh} exited 255.*\\nNeeds input: ssh does not know the host key`, "s"));
+  });
+
   it("sends one message to an idle thread when a job ends, then forgets it", async () => {
     const t = await boot();
     const id = await t.start("deploy", ["--notify"]);
@@ -402,6 +417,18 @@ describe("bb jobs CLI", () => {
     assert.match(empty.stdout, /Nothing to prune from this thread\. Add --all/);
     const all = await t.harness.behavior.runCli(["prune", "--older-than", "0", "--all", "--json"], { threadId: THREAD });
     assert.deepEqual(JSON.parse(all.stdout).pruned.map((p: { id: string }) => p.id), [theirs]);
+  });
+
+  it("says when a job ended at once because it needed input", async () => {
+    const t = await boot({ service: false });
+    const run = t.harness.behavior.runCli(["start", "--name", "root", "--cwd", "/tmp", "--", "sudo systemctl restart x"], { threadId: THREAD });
+    await until(() => t.jobs.size === 1);
+    t.end([...t.jobs.keys()][0]!, 1, "sudo: a terminal is required to read the password\n");
+    const result = await run;
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stdout, /\nNEEDS INPUT: sudo wanted a password/);
+    const waited = await t.harness.behavior.runCli(["wait", [...t.jobs.keys()][0]!], { threadId: THREAD });
+    assert.match(waited.stdout, /NEEDS INPUT: sudo/);
   });
 
   it("tells a refused start from one whose result is unknown", async () => {
