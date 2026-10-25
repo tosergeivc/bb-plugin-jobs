@@ -27,10 +27,16 @@ type NotifyEntry = {
   hostId: string;
   threadId: string;
   addedAt: string;
-  /** Failed send attempts; the entry is dropped after NOTIFY_MAX_FAILURES. */
+  /** Failed send attempts to an idle thread (each one doubles the wait). */
   failures?: number;
+  /** Epoch ms before which the entry is not retried. */
+  nextAttemptAt?: number;
 };
-const NOTIFY_MAX_FAILURES = 5;
+/** A notice that could not be delivered for this long is dropped. */
+const NOTIFY_GIVE_UP_MS = 72 * 3600 * 1000;
+const NOTIFY_BACKOFF_BASE_MS = 30_000;
+const NOTIFY_BACKOFF_MAX_MS = 6 * 3600 * 1000;
+const BUSY_STATES = new Set(["active", "starting", "stopping", "pending"]);
 /**
  * Notices sent but still waiting in the thread's queue (the thread was busy).
  * While queued they can be edited: a job the agent has read in the meantime
@@ -263,6 +269,9 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  /** Set after bb failed to queue a message; reset when the plugin reloads. */
+  let queueBroken = false;
+
   /** One pass: every thread gets at most one message for all its ended jobs. */
   async function deliverNotices(signal: AbortSignal): Promise<void> {
     await cleanupSent().catch((error: unknown) =>
@@ -271,8 +280,15 @@ export default async function plugin(bb: BbPluginApi) {
     const entries = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
     const byThread = new Map<string, { id: string; section: string }[]>();
     const drops: string[] = [];
+    const now = Date.now();
     for (const [id, entry] of Object.entries(entries)) {
       if (signal.aborted) return;
+      if (now - Date.parse(entry.addedAt) > NOTIFY_GIVE_UP_MS) {
+        bb.log.warn(`notice for ${id} dropped: not delivered within 72 h`);
+        drops.push(id);
+        continue;
+      }
+      if (entry.nextAttemptAt && entry.nextAttemptAt > now) continue;
       const check = await checkNotice(id, entry).catch((error: unknown) => {
         bb.log.warn(`notice check for ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
         return { kind: "pending" } as const;
@@ -291,6 +307,11 @@ export default async function plugin(bb: BbPluginApi) {
       const current = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
       const fresh = items.filter((item) => current[item.id]);
       if (!fresh.length) continue;
+      const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+      const busy = thread !== null && BUSY_STATES.has(thread.status);
+      // Once bb has failed to queue a message, wait until the thread is idle:
+      // a message to an idle thread is delivered without the queue.
+      if (busy && queueBroken) continue;
       try {
         await withSentLock(async () => {
           const sent = await readSent();
@@ -335,13 +356,25 @@ export default async function plugin(bb: BbPluginApi) {
         await updateNotify((all) => fresh.forEach((item) => delete all[item.id]));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (busy) {
+          // The thread was busy, so bb tried to queue the message and failed
+          // (bb 0.46.1 with a newer database schema does this). Not counted as
+          // a failure: the notice goes out directly once the thread is idle.
+          if (!queueBroken) {
+            bb.log.warn(`queueing a notice failed (${message}); notices now wait until their thread is idle`);
+          }
+          queueBroken = true;
+          continue;
+        }
         bb.log.warn(`notice to ${threadId} failed: ${message}`);
         await updateNotify((all) => {
           for (const item of fresh) {
             const entry = all[item.id];
             if (!entry) continue;
             entry.failures = (entry.failures ?? 0) + 1;
-            if (entry.failures >= NOTIFY_MAX_FAILURES) delete all[item.id];
+            entry.nextAttemptAt =
+              Date.now() +
+              Math.min(NOTIFY_BACKOFF_BASE_MS * 2 ** (entry.failures - 1), NOTIFY_BACKOFF_MAX_MS);
           }
         });
       }
