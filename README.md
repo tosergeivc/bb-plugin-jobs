@@ -42,7 +42,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.4.2
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.4.3
 ```
 
 bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
@@ -197,7 +197,7 @@ bb plugin install .
 
 ## Changelog
 
-- **Unreleased** — loads on bb plugin SDK 0.6.43 and newer (bb 0.46.1); notices that bb cannot queue wait for the thread to become idle; failed notices are retried with backoff for up to 72 hours instead of being dropped after five tries.
+- **0.4.3** — loads on bb plugin SDK 0.6.43 and newer (bb 0.46.1); notices that bb cannot queue wait for the thread to become idle; failed notices are retried with backoff for up to 72 hours instead of being dropped after five tries.
 - **0.4.2** — the `[jobs] exited` line is written after all of the command's output (it could land before the last lines, and after a log rotation in `output.log.1`); job processes are recognised whatever path or version the bash/perl interpreter shows in `ps`; CI on Linux and macOS.
 - **0.4.1** — shorter notices (one result line with duration, log location, last 5 lines for exit 0, last 2 KiB otherwise, no repeated `[jobs]` lines); notices are agent-only by default (`notifyVisibility` setting); records of sent notices are cleaned every minute; README explains when a notice cannot be withdrawn.
 - **0.4.0** — `logs` removes terminal colour codes and progress-bar redraws (`--raw` keeps them) and reads by cursor (`--since`, `next:` line, `--json`); `--ready-log` now matches the cleaned text; one notice per thread for jobs that end together, cancelled when the agent already read the result; `list` shows the calling thread's jobs (`--all` for every thread); `stop` refuses another thread's running job without `--force`; skill: `bb connect expose` for remote viewers; README: works well with Lame duck, Env Catalog, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`.
