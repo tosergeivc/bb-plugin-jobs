@@ -10,7 +10,12 @@ import {
   type BbPluginApi,
 } from "@get-bb/plugin-sdk";
 import { hostContract, type Job } from "./contract.js";
-import { shellQuote } from "./jobs-core.js";
+import {
+  CPU_QUOTA_PATTERN,
+  KEY_PATTERN,
+  MEMORY_MAX_PATTERN,
+  shellQuote,
+} from "./jobs-core.js";
 
 const LOG_DEFAULT_BYTES = 16 * 1024;
 const LOG_MAX_BYTES = 512 * 1024;
@@ -668,6 +673,24 @@ export default async function plugin(bb: BbPluginApi) {
               }
               env[key] = pair.slice(eq + 1);
             }
+            const usage = (message: string, code: string, hint?: string) =>
+              new PluginCliError(message, { code, hint });
+            const memoryMax = input.options["memory-max"];
+            if (memoryMax !== undefined && !MEMORY_MAX_PATTERN.test(memoryMax)) {
+              throw usage(`bad --memory-max ${memoryMax}`, "invalid_value", "Use bytes with K/M/G/T (512M, 2G) or a percentage (30%).");
+            }
+            const cpuQuota = input.options["cpu-quota"];
+            if (cpuQuota !== undefined && !CPU_QUOTA_PATTERN.test(cpuQuota)) {
+              throw usage(`bad --cpu-quota ${cpuQuota}`, "invalid_value", "Use a percentage: 100% is one core, 150% one and a half.");
+            }
+            const key = input.options.key;
+            if (key !== undefined && !KEY_PATTERN.test(key)) {
+              throw usage("bad --key", "invalid_value", "Use 1-200 printable ASCII characters without spaces.");
+            }
+            const envFile = input.options["env-file"];
+            if (envFile !== undefined && !envFile.startsWith("/")) {
+              throw usage(`--env-file must be an absolute path: ${envFile}`, "invalid_value");
+            }
             const hostId = await resolveHost(input.options.machine, ctx.threadId);
             const name =
               input.options.name ?? command.trim().split(/\s+/)[0]!.slice(0, 64);
@@ -694,7 +717,13 @@ export default async function plugin(bb: BbPluginApi) {
               },
               hostId,
               ctx.signal,
-            );
+            ).catch((error: unknown) => {
+              // The machine refused the job (missing cwd or env file, no
+              // systemd for limits): a usage error, not a plugin failure.
+              throw new PluginCliError(error instanceof Error ? error.message : String(error), {
+                code: "start_refused",
+              });
+            });
             if (notifyThread) {
               await updateNotify((all) => {
                 all[job.id] = { hostId, threadId: notifyThread, addedAt: new Date().toISOString() };

@@ -330,6 +330,16 @@ describe("bb jobs CLI", () => {
     assert.equal(t.jobs.size, 1);
   });
 
+  it("reports bad values and refused starts as usage errors", async () => {
+    const t = await boot();
+    for (const args of [["--memory-max", "lots"], ["--cpu-quota", "1.5"], ["--key", "has space"], ["--env-file", "relative.env"]]) {
+      const result = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", ...args, "--", "true"], { threadId: THREAD });
+      assert.equal(result.exitCode, 1, args.join(" "));
+      assert.doesNotMatch(result.stderr, /failed:/, `${args.join(" ")}: ${result.stderr}`);
+    }
+    assert.equal(t.jobs.size, 0, "nothing started");
+  });
+
   it("rejects --notify outside a thread with a hint", async () => {
     const t = await boot();
     const result = await t.harness.behavior.runCli(
