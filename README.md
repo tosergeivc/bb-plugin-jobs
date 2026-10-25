@@ -44,7 +44,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.0
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.1
 ```
 
 bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
@@ -206,6 +206,7 @@ bb plugin install .
 
 ## Changelog
 
+- **0.5.1** — invalid `--memory-max`, `--cpu-quota`, `--key` and `--env-file` values, and starts the machine refuses (missing working directory or env file, no systemd for limits), are reported as usage errors with a hint; before, `bb plugin list` showed them as "cli jobs failed" next to the running plugin.
 - **0.5.0** — `--key` idempotent start (concurrent and repeated starts with one key give one job); `--env-file` loads secrets from a file on the job's machine without passing them through bb; `--memory-max`, `--cpu-quota`, `--tasks-max` set systemd limits for the job; `--require-systemd` refuses detached mode; README: `env.sh` is written briefly, ssh jobs, not a deployment system.
 - **0.4.3** — loads on bb plugin SDK 0.6.43 and newer (bb 0.46.1); notices that bb cannot queue wait for the thread to become idle; failed notices are retried with backoff for up to 72 hours instead of being dropped after five tries.
 - **0.4.2** — the `[jobs] exited` line is written after all of the command's output (it could land before the last lines, and after a log rotation in `output.log.1`); job processes are recognised whatever path or version the bash/perl interpreter shows in `ps`; CI on Linux and macOS.
