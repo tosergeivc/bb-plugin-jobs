@@ -18,7 +18,7 @@
   ],
   "engines": {
     "bb": ">=0.46",
-    "bbPluginSdk": ">=0.6.73"
+    "bbPluginSdk": ">=0.6.43"
   },
   "bb": {
     "name": "Jobs",
@@ -37,7 +37,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.6.73",
+    "@get-bb/plugin-sdk": "0.6.43",
     "@types/node": "^22.0.0",
     "esbuild": "0.28.1",
     "typescript": "^5.7.0"

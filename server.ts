@@ -316,7 +316,6 @@ export default async function plugin(bb: BbPluginApi) {
             const result = await bb.sdk.threads.send({
               threadId,
               mode: "queue-if-active",
-              originPluginId: bb.pluginId,
               input: await noticeInput(fresh.map((item) => item.section)),
             });
             if (result.delivery === "queued") queuedMessageId = result.queuedMessage.id;
