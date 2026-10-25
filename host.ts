@@ -26,7 +26,7 @@ export default experimental_defineHostEntry({
       jobs(ctx.experimental_paths.dataDir).ready(id, { url, logPattern }, timeoutMs),
     releaseKey: ({ key, force }, ctx) =>
       jobs(ctx.experimental_paths.dataDir).releaseKey(key, { force }),
-    prune: ({ olderThanMs, delete: remove, dryRun }, ctx) =>
-      jobs(ctx.experimental_paths.dataDir).prune(olderThanMs, { remove, dryRun }),
+    prune: ({ olderThanMs, delete: remove, dryRun, threadId }, ctx) =>
+      jobs(ctx.experimental_paths.dataDir).prune(olderThanMs, { remove, dryRun, threadId }),
   },
 });

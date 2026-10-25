@@ -1013,9 +1013,9 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
         prune: cliCommand({
-          summary: "Archive (or delete) finished jobs older than a given age",
+          summary: "Archive (or delete) this thread's finished jobs older than a given age",
           description:
-            "Moves job directories of finished jobs into the plugin's archive directory. Running jobs are never touched. Use --delete to free the disk space instead.",
+            "Moves job directories of finished jobs into the plugin's archive directory. Running jobs are never touched. From a thread, only that thread's jobs; --all for every job on the machine. Use --delete to free the disk space instead.",
           options: {
             "older-than": {
               type: "duration",
@@ -1032,17 +1032,24 @@ export default async function plugin(bb: BbPluginApi) {
               type: "boolean",
               description: "Only list what would be pruned",
             },
+            all: {
+              type: "boolean",
+              description:
+                "Jobs of every thread on the machine. Default from a thread: only that thread's jobs",
+            },
             machine: machineOption,
             json: jsonOption,
           },
           async run(input, ctx) {
             const hostId = await resolveHost(input.options.machine, ctx.threadId);
+            const threadId = input.options.all ? null : (ctx.threadId ?? null);
             const result = await call(
               "prune",
               {
                 olderThanMs: input.options["older-than"],
                 delete: input.options.delete,
                 dryRun: input.options["dry-run"],
+                threadId,
               },
               hostId,
               ctx.signal,
@@ -1062,7 +1069,9 @@ export default async function plugin(bb: BbPluginApi) {
                 ? `${verb} ${result.pruned.length} job(s), ${(total / 1024 / 1024).toFixed(1)} MiB\n` +
                   result.pruned.map((p) => `  ${p.id}`).join("\n") +
                   "\n"
-                : "Nothing to prune.\n",
+                : threadId
+                  ? "Nothing to prune from this thread. Add --all for every thread's jobs.\n"
+                  : "Nothing to prune.\n",
             };
           },
         }),

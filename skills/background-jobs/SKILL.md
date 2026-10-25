@@ -29,7 +29,7 @@ log file.
 | `bb jobs logs <id> --since <N>` | Only output written after cursor N, in whole lines. Every `logs` call prints `next: --since N` on stderr. |
 | `bb jobs wait <id> [--timeout 5m]` | Block until the job ends (max 10m per call); exit code mirrors the job, 124 if still running. |
 | `bb jobs stop <id>` | SIGTERM the whole process tree, SIGKILL after 15 s. Refuses another thread's running job unless `--force`. |
-| `bb jobs prune --older-than 7d` | Move finished jobs to the archive (`--delete` to free disk). Only when the user asks to clean up. |
+| `bb jobs prune --older-than 7d` | Move this thread's finished jobs to the archive (`--delete` to free disk). Only when the user asks to clean up; `--all` (every thread's jobs) only when the user asks for that. |
 
 All commands accept `--machine <id|name>` to target another machine and
 `--json` (except `logs`, `wait`) for machine-readable output.

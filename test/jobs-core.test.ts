@@ -712,3 +712,19 @@ describe("--key recovery (0.5.3)", () => {
     await assert.rejects(jobs.start({ ...base, memoryMax: "101%" }), /bad --memory-max/);
   });
 });
+
+describe("prune scope (0.5.4)", () => {
+  it("with a thread id, only that thread's finished jobs are pruned", async () => {
+    const jobs = new JobManager(mkdtempSync(path.join(tmpdir(), "bbjobs-scope-")), { forceDetached: true });
+    const base = { cwd: "/tmp", env: {}, timeoutSec: null, command: "true" };
+    const mine = await jobs.start({ ...base, name: "mine", threadId: "thr_me" });
+    const theirs = await jobs.start({ ...base, name: "theirs", threadId: "thr_other" });
+    const none = await jobs.start({ ...base, name: "none", threadId: null });
+    for (const j of [mine, theirs, none]) await until(() => jobs.get(j.id), (x) => x.state !== "running");
+    const scoped = await jobs.prune(0, { remove: false, dryRun: false, threadId: "thr_me" });
+    assert.deepEqual(scoped.pruned.map((p) => p.id), [mine.id]);
+    assert.deepEqual((await jobs.list(50)).map((j) => j.id).sort(), [none.id, theirs.id].sort(), "other jobs stay");
+    const all = await jobs.prune(0, { remove: false, dryRun: false, threadId: null });
+    assert.deepEqual(all.pruned.map((p) => p.id).sort(), [none.id, theirs.id].sort());
+  });
+});

@@ -44,7 +44,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.3
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.4
 ```
 
 bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
@@ -61,7 +61,7 @@ bb jobs stop deploy-1a2b3c
 
 bb jobs start --name api --ready-url http://localhost:3000/health -- 'npm start'
 bb jobs start --name migrate --notify -- './migrate.sh'   # the thread gets a message when it ends
-bb jobs prune --older-than 7d
+bb jobs prune --older-than 7d                  # this thread's finished jobs; --all for every thread
 ```
 
 | Command | Effect |
@@ -81,7 +81,7 @@ bb jobs prune --older-than 7d
 | `bb jobs logs <id> --since N` | Only output written after cursor N, in whole lines while the job runs; each call prints `next: --since N` on stderr |
 | `bb jobs wait <id> [--timeout 5m]` | Wait up to 10 min; exit code mirrors the job, 124 if still running |
 | `bb jobs stop <id> [--force]` | SIGTERM the whole process tree, SIGKILL 15 s later; another thread's running job needs `--force` |
-| `bb jobs prune --older-than 7d [--delete] [--dry-run]` | Move finished jobs that ended at least that long ago to the plugin's `archive/` directory, or delete them; running jobs are never touched |
+| `bb jobs prune --older-than 7d [--delete] [--dry-run] [--all]` | Move finished jobs that ended at least that long ago to the plugin's `archive/` directory, or delete them; running jobs are never touched. From a thread, only that thread's jobs (like `list`); `--all` for every job on the machine. Outside a thread, every job |
 
 Every command accepts `--machine <id|name>`. Without it, the job runs on the machine of the calling thread. `start`, `list`, `status`, `logs` and `prune` accept `--json`.
 
@@ -168,7 +168,7 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on two Linux machi
 
 Real-agent check (0.4.0, 24 October 2026): a Codex thread on the Linux server, given an ordinary task ("start a server that outlives your turn, run a 40-second deploy") without any mention of `bb jobs`, found the `background-jobs` skill, started the server with `--ready-url` and the deploy with `--notify`, and ended its turn. The server kept answering after the turn; the deploy's notice woke the idle thread, which reported exit 0 and its output. The Codex sandbox did not block the `bb` CLI. Another thread's `bb jobs stop` on that server was refused without `--force`.
 
-Tests (`npm test`) run on Linux and macOS in [GitHub Actions](https://github.com/tosergeivc/bb-plugin-jobs/actions/workflows/ci.yml) on every push: 64 tests. 13 of them drive `server.ts` through the SDK's fake plugin host (notices: one per thread, cancelled after the agent read the result, withdrawn from and merged into a waiting notice, waiting for an idle thread when bb cannot queue, backoff, 72-hour limit; thread-scoped `list`; `stop --force`). `npm run typecheck` checks against the oldest supported SDK (0.6.43) and the newest published one. The remaining 51 cover including terminal-code cleaning, cursor reads across log rotation, including `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
+Tests (`npm test`) run on Linux and macOS in [GitHub Actions](https://github.com/tosergeivc/bb-plugin-jobs/actions/workflows/ci.yml) on every push: 81 tests. 15 drive `server.ts` through the SDK's fake plugin host (notices: one per thread, cancelled after the agent read the result, withdrawn from and merged into a waiting notice, waiting for an idle thread when bb cannot queue, backoff, 72-hour limit; thread-scoped `list` and `prune`; `stop --force`; error codes of refused, unknown and keyed starts; `release-key`). 3 start three processes at once with one `--key`. The remaining 63 cover terminal-code cleaning, cursor reads across log rotation, `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, `--key` claims and their recovery, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
 
 ## Limitations
 
@@ -191,7 +191,7 @@ Tests (`npm test`) run on Linux and macOS in [GitHub Actions](https://github.com
 ```bash
 npm install
 npm run typecheck
-npm test            # bundles test/jobs-core.test.ts with esbuild and runs node --test
+npm test            # bundles each test/*.test.ts with esbuild and runs node --test
 bb plugin build
 bb plugin install .
 ```
@@ -210,6 +210,7 @@ bb plugin install .
 
 ## Changelog
 
+- **0.5.4** — `bb jobs prune` run from a thread archives or deletes only that thread's jobs, like `list`; `--all` covers every thread's jobs on the machine. Before, a prune from one thread also archived other threads' finished jobs.
 - **0.5.3** — `--key` holds across processes: claims are a numbered history in which only one process can add each entry, so two processes starting with one key at once start one job (before, a race could start two or three). A claim also records its process's start time, so a reused PID no longer keeps a key busy. A damaged claim gives `key_unknown` and `release-key` frees it. A start interrupted after launching is listed as `incomplete` and can be stopped; a launch that failed before anything ran (`systemd-run` rejected the unit) frees the key at once instead of leaving `key_unknown`. `release-key` refuses while a start with the key is in progress or a job it started exists, unless `--force`, and unlinks the key from every job directory. An error after the launch keeps the key bound, so a retry with the same key returns the job. `/tmp/` and `/tmp` count as one directory; a key from 0.5.0/0.5.1 is compared by command and directory. Start errors are `start_refused` (nothing ran) or `start_unknown` (answer lost, the job may run). `--cpu-quota 0%`, `--memory-max 0` and percentages above 100% are refused. Tests: three processes race on one key.
 - **0.5.2** — `--key` no longer frees a pending claim after 15–60 seconds, which could start a second job when a first start was slow: same-key starts wait for each other in the worker, a claim of another live process gives `key_busy`, a dead owner is reconciled from the job directory (nothing started: claim again; complete job: reuse it; half-way: `key_unknown`), and `bb jobs release-key` frees a key by renaming its claim. Keys are bound to the request (`key_conflict`). `--env-file` refuses files other users can read or write. The skill no longer suggests `--env TOKEN="$TOKEN"`.
 - **0.5.1** — invalid `--memory-max`, `--cpu-quota`, `--key` and `--env-file` values, and starts the machine refuses (missing working directory or env file, no systemd for limits), are reported as usage errors with a hint; before, `bb plugin list` showed them as "cli jobs failed" next to the running plugin.

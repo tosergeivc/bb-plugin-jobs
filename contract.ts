@@ -132,6 +132,8 @@ export const hostContract = defineRpcContract({
         olderThanMs: z.number().int().min(0),
         delete: z.boolean(),
         dryRun: z.boolean(),
+        // Only jobs started from this thread; null = every job on the machine.
+        threadId: z.string().nullable(),
       })
       .strict(),
     output: z

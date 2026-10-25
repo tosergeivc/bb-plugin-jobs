@@ -1149,15 +1149,17 @@ export class JobManager {
 
   /**
    * Move finished jobs older than `olderThanMs` to <root>/archive/, or delete
-   * them with `remove`. Running jobs are never touched.
+   * them with `remove`. Running jobs are never touched. With `threadId`, only
+   * jobs started from that thread.
    */
   async prune(
     olderThanMs: number,
-    options: { remove: boolean; dryRun: boolean },
+    options: { remove: boolean; dryRun: boolean; threadId?: string | null },
   ): Promise<{ pruned: { id: string; bytes: number }[]; archiveDir: string }> {
     const cutoff = Date.now() - olderThanMs;
     const pruned: { id: string; bytes: number }[] = [];
     for (const meta of await this.readAllMeta()) {
+      if (options.threadId && meta.threadId !== options.threadId) continue;
       const job = await this.describe(meta);
       if (job.state === "running") continue;
       const ended = Date.parse(job.finishedAt ?? job.createdAt);

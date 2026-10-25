@@ -150,6 +150,13 @@ function setup() {
           const job = need(input.id);
           return { job: publicJob(job), text: job.output, truncated: false, cursor: job.output.length, skippedBytes: 0 };
         }
+        case "prune": {
+          const gone = [...jobs.values()].filter(
+            (j) => j.state !== "running" && (input.threadId === null || j.threadId === input.threadId),
+          );
+          if (!input.dryRun) for (const j of gone) jobs.delete(j.id);
+          return { pruned: gone.map((j) => ({ id: j.id, bytes: 10 })), archiveDir: "/data/archive" };
+        }
         case "releaseKey":
           if (keys.has(String(input.key)) && !input.force) {
             throw new Error(`key_in_use: --key ${String(input.key)} belongs to job ${keys.get(String(input.key))} (running); add --force`);
@@ -380,6 +387,21 @@ describe("bb jobs CLI", () => {
     const again = await t.harness.behavior.runCli(["start", "--cwd", "/tmp", "--key", "k1", "--", "false"], { threadId: THREAD });
     assert.equal(again.exitCode, 0, again.stderr);
     assert.equal(t.jobs.size, 2);
+  });
+
+  it("prunes only the calling thread's jobs unless --all", async () => {
+    const t = await boot({ service: false });
+    const mine = await t.start("mine");
+    const theirs = await t.start("theirs", [], OTHER);
+    t.end(mine, 0);
+    t.end(theirs, 0);
+    const scoped = await t.harness.behavior.runCli(["prune", "--older-than", "0", "--json"], { threadId: THREAD });
+    assert.deepEqual(JSON.parse(scoped.stdout).pruned.map((p: { id: string }) => p.id), [mine]);
+    assert.ok(t.jobs.has(theirs), "another thread's job stays");
+    const empty = await t.harness.behavior.runCli(["prune", "--older-than", "0"], { threadId: THREAD });
+    assert.match(empty.stdout, /Nothing to prune from this thread\. Add --all/);
+    const all = await t.harness.behavior.runCli(["prune", "--older-than", "0", "--all", "--json"], { threadId: THREAD });
+    assert.deepEqual(JSON.parse(all.stdout).pruned.map((p: { id: string }) => p.id), [theirs]);
   });
 
   it("tells a refused start from one whose result is unknown", async () => {
