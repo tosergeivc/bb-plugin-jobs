@@ -44,10 +44,13 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.4
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.5
 ```
 
-bb builds the plugin on install. The plugin ships a skill (`background-jobs`) that bb gives to agents in every thread, so agents start using `bb jobs` without extra prompting.
+bb builds the plugin on install. The plugin ships two skills that bb gives to agents in every thread:
+
+- `background-jobs` — agents start using `bb jobs` without extra prompting.
+- `task-preflight` — before multi-step work that may need the owner (deploys, releases, installs, pushes, other machines, credentials), the agent lists what can block it, checks what it can without changing anything, asks all owner questions in one form, and saves the answers to `$BB_THREAD_STORAGE/preflight.json`, so later turns and subthreads reuse them instead of stopping on a question mid-way. An answer covers only what was asked; only the owner's own answer counts.
 
 Plugins are full-trust code inside the bb server. Read the source before installing; it is about 1,500 lines of TypeScript, with small embedded bash and perl helpers.
 
@@ -88,7 +91,7 @@ Every command accepts `--machine <id|name>`. Without it, the job runs on the mac
 Command rules:
 
 - One token after `--` runs as a bash line, so pipes, `&&` and redirects work: `-- './build.sh && ./deploy.sh 2>&1'`. Several tokens are quoted one by one: `-- npm run dev`.
-- The job has no stdin. Pass answers with flags or `--env`.
+- The job has no stdin and no terminal. Pass answers with flags or `--env`. A prompt does not wait: `sudo`, an ssh password or unknown host key, a git credential prompt, Python `input()` or a `[y/N]` question fail at once. `start`, `wait` and `ready` then print `NEEDS INPUT:` with the reason and what to do, and a `--notify` notice for such a job is shown in the chat even when notices are set to agent-only, because only a person can give that input.
 - A job inherits only `PATH HOME USER LOGNAME SHELL LANG LC_ALL TZ SSH_AUTH_SOCK` from the machine; add the rest with `--env`. Started from a thread, it also gets `BB_THREAD_ID` and `BB_PROJECT_ID`, plus `BB_ENVIRONMENT_ID` and `BB_THREAD_STORAGE` when it runs on the thread's own machine.
 - States: `running`, `exited` (with code), `stopped` (by `bb jobs stop`), `lost` (gone without an exit code: reboot, OOM, external kill), `incomplete` (the start was interrupted between launching and confirming; nothing runs now, and whether the command ran is unknown: check its log and, on Linux, `systemctl --user status bbjob-<id>`), `not-started` (the launch failed before any process existed; not shown by `list`).
 - When the start itself fails, the error code says what happened: `start_refused` means nothing ran (missing directory or env file, bad value, `systemd-run` rejected the unit); `start_unknown` means the answer was lost, for example a timeout, and the job may be running. Repeat a `start_unknown` start with the same `--key`, or check `bb jobs list` first.
@@ -168,7 +171,7 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on two Linux machi
 
 Real-agent check (0.4.0, 24 October 2026): a Codex thread on the Linux server, given an ordinary task ("start a server that outlives your turn, run a 40-second deploy") without any mention of `bb jobs`, found the `background-jobs` skill, started the server with `--ready-url` and the deploy with `--notify`, and ended its turn. The server kept answering after the turn; the deploy's notice woke the idle thread, which reported exit 0 and its output. The Codex sandbox did not block the `bb` CLI. Another thread's `bb jobs stop` on that server was refused without `--force`.
 
-Tests (`npm test`) run on Linux and macOS in [GitHub Actions](https://github.com/tosergeivc/bb-plugin-jobs/actions/workflows/ci.yml) on every push: 81 tests. 15 drive `server.ts` through the SDK's fake plugin host (notices: one per thread, cancelled after the agent read the result, withdrawn from and merged into a waiting notice, waiting for an idle thread when bb cannot queue, backoff, 72-hour limit; thread-scoped `list` and `prune`; `stop --force`; error codes of refused, unknown and keyed starts; `release-key`). 3 start three processes at once with one `--key`. The remaining 63 cover terminal-code cleaning, cursor reads across log rotation, `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, `--key` claims and their recovery, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
+Tests (`npm test`) run on Linux and macOS in [GitHub Actions](https://github.com/tosergeivc/bb-plugin-jobs/actions/workflows/ci.yml) on every push: 85 tests. 17 drive `server.ts` through the SDK's fake plugin host (notices: one per thread, cancelled after the agent read the result, withdrawn from and merged into a waiting notice, waiting for an idle thread when bb cannot queue, backoff, 72-hour limit; thread-scoped `list` and `prune`; `stop --force`; error codes of refused, unknown and keyed starts; `release-key`; `NEEDS INPUT` in output and owner-visible notices). 3 start three processes at once with one `--key`. The remaining 65 cover input hints from real job output, terminal-code cleaning, cursor reads across log rotation, `--env` cleanup, log rotation, readiness (URL, log line, early exit, timeout), prune, `--key` claims and their recovery, and strangers (a `tail -f` of the job log, a process planted on the job's PID and process group) that must be neither reported nor signalled.
 
 ## Limitations
 
@@ -203,6 +206,7 @@ bb plugin install .
 | `host.ts` | bb host entry |
 | `server.ts` | `bb jobs` CLI |
 | `skills/background-jobs/SKILL.md` | Instructions bb gives to agents |
+| `skills/task-preflight/SKILL.md` | Owner questions asked once before multi-step work, answers saved in thread storage |
 | `PLUGIN_OVERVIEW.md` | Long description for the bb marketplace |
 | `test/` | `jobs-core` tests for both modes; `server.test.ts` for the CLI and notices |
 | `scripts/typecheck-latest.mjs` | Typecheck against the newest published SDK |
@@ -210,6 +214,7 @@ bb plugin install .
 
 ## Changelog
 
+- **0.5.5** — new skill `task-preflight`: before multi-step work the agent lists what may need the owner, checks what it can, asks once and saves the answers in thread storage. A job that failed because it needed input (sudo, ssh password or host key, git credentials, Python `input()`, a `[y/N]` prompt) gets a `NEEDS INPUT:` line with the reason in `start`, `wait` and `ready`, and its notice is shown in the chat even with agent-only notices.
 - **0.5.4** — `bb jobs prune` run from a thread archives or deletes only that thread's jobs, like `list`; `--all` covers every thread's jobs on the machine. Before, a prune from one thread also archived other threads' finished jobs.
 - **0.5.3** — `--key` holds across processes: claims are a numbered history in which only one process can add each entry, so two processes starting with one key at once start one job (before, a race could start two or three). A claim also records its process's start time, so a reused PID no longer keeps a key busy. A damaged claim gives `key_unknown` and `release-key` frees it. A start interrupted after launching is listed as `incomplete` and can be stopped; a launch that failed before anything ran (`systemd-run` rejected the unit) frees the key at once instead of leaving `key_unknown`. `release-key` refuses while a start with the key is in progress or a job it started exists, unless `--force`, and unlinks the key from every job directory. An error after the launch keeps the key bound, so a retry with the same key returns the job. `/tmp/` and `/tmp` count as one directory; a key from 0.5.0/0.5.1 is compared by command and directory. Start errors are `start_refused` (nothing ran) or `start_unknown` (answer lost, the job may run). `--cpu-quota 0%`, `--memory-max 0` and percentages above 100% are refused. Tests: three processes race on one key.
 - **0.5.2** — `--key` no longer frees a pending claim after 15–60 seconds, which could start a second job when a first start was slow: same-key starts wait for each other in the worker, a claim of another live process gives `key_busy`, a dead owner is reconciled from the job directory (nothing started: claim again; complete job: reuse it; half-way: `key_unknown`), and `bb jobs release-key` frees a key by renaming its claim. Keys are bound to the request (`key_conflict`). `--env-file` refuses files other users can read or write. The skill no longer suggests `--env TOKEN="$TOKEN"`.

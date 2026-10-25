@@ -9,6 +9,7 @@ An agent that starts a dev server or a deploy from its Bash tool loses it when t
 - `--key` makes a start idempotent, `--env-file` loads secrets from a file on the job's machine without passing them through bb, and `--memory-max`, `--cpu-quota`, `--tasks-max` and `--require-systemd` bound critical jobs.
 - Logs are capped (`--log-max`, default 50 MiB, rotated once). `bb jobs prune` archives or deletes old jobs.
 - A `background-jobs` skill tells agents to use `bb jobs` instead of `&`, `nohup` or a provider's own background mode.
+- A `task-preflight` skill makes agents ask the owner's questions once before multi-step work and save the answers in thread storage. Jobs that fail because they needed input (sudo, ssh, git credentials, a prompt) are reported as `NEEDS INPUT`, and their notice is shown in the chat.
 
 ## How it differs from similar plugins
 
