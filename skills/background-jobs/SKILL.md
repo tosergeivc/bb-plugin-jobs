@@ -36,6 +36,10 @@ All commands accept `--machine <id|name>` to target another machine and
 
 ## Rules
 
+- Before the first `bb jobs start` of a deploy, a server or anything that
+  needs root, credentials, another machine or a public link, run the
+  `task-preflight` checks and ask the owner once. Do not discover a blocker by
+  starting the job.
 - Quote the whole command as one token when it uses pipes, `&&`, `;` or
   redirects: `bb jobs start --name deploy -- './deploy.sh prod 2>&1 | tee deploy.txt'`.
   Several tokens are quoted one by one: `bb jobs start -- npm run dev`.

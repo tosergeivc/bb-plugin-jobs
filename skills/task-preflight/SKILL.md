@@ -1,6 +1,6 @@
 ---
 name: task-preflight
-description: Before multi-step work that may need the owner — deploys, releases, installs, pushes, other machines, credentials, service restarts — list everything that can block it, check what can be checked without changing anything, ask all owner questions in one form, and save the answers in thread storage so later turns and subthreads do not ask again. Use at the start of such a task, and when a task's scope grows mid-way.
+description: Before the first change in any deploy, service start, release, install, push, upload, or work on another machine — even a short one — list what can block it (root, privileged ports, credentials, missing tools, public actions, other machines), check it without changing anything, ask all owner questions in one form, and save the answers in thread storage so later turns and subthreads do not ask again. Use at the start of such a task, and when a task's scope grows mid-way.
 ---
 
 # Task preflight
@@ -10,7 +10,15 @@ A task that stops half-way on a question ("may I push?", "which machine?",
 re-reading the context. Find those questions before the work starts and ask
 them together.
 
-Skip this for read-only work, local edits and single quick commands.
+**Do steps 1–4 before the first command that changes anything**: creating
+files, starting a server or job, installing, uploading, exposing a port.
+Reading files and running the checks below is fine before that. This holds
+for a task that looks like one short deploy too: the blocker is usually found
+by trying (`EACCES`, `Permission denied`, a missing credential) after the
+work is half done, while a check finds it in a second.
+
+Skip this for read-only work and local edits that need nothing outside this
+workspace.
 
 ## 1. Read what was already answered
 
@@ -40,19 +48,36 @@ done by a person: a background job has no terminal and fails at once.
 
 ## 3. Check without changing anything
 
-Run what answers a question by itself, so it is not asked:
+Run what answers a question by itself, so it is not asked. Pick the lines
+that fit the task:
 
 ```sh
-gh auth status                 # accounts and token scopes
-bb status                      # this thread, its parent, machine
-bb machine list                # which machines are online
-command -v node perl systemd-run
+sudo -n true 2>&1 && echo "sudo: yes" || echo "sudo: no"   # can root steps run at all?
+cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null  # Linux: lowest port a non-root process may bind
+test -w /target/dir && echo writable || echo "not writable"
+command -v node docker aws rsync                             # tools the task needs
+gh auth status                                               # GitHub accounts and token scopes
+test -f ~/.aws/credentials; env | cut -d= -f1 | grep -i token # credentials exist (names only)
+bb status; bb machine list                                   # this thread, machines online
+bb connect status                                            # can a port be shared publicly
 df -h .
 ```
 
-Also `test -f` for files the task needs, `ssh -o BatchMode=yes -o
-ConnectTimeout=5 HOST true` only for hosts you are already allowed to use,
-and `curl -sS -o /dev/null -w '%{http_code}' URL` for services.
+Also `ssh -o BatchMode=yes -o ConnectTimeout=5 HOST true` only for hosts you
+are already allowed to use, and `curl -sS -o /dev/null -w '%{http_code}'
+URL` for services.
+
+Turn each failed check into a decision before you start:
+
+| Check result | Decide before starting |
+|--------------|------------------------|
+| No sudo, and a step needs root (a port below the limit, a system service, a package) | Offer a non-root way (port 8080 shared with `bb connect expose`, a user service) and ask whether it is enough, or which step the owner runs |
+| A tool, credential or token scope is missing | Ask where it is or whether to install it; installing may itself need the owner |
+| A public or outward action (share a port, push, publish, upload, send) | Say exactly what becomes reachable or visible; the task's own words may already approve it |
+| Another machine | Ask which one and whether you may run commands there |
+
+When a sensible default exists, say it in the question ("I will use port
+8080 unless you want 80"), so one answer — or none — lets you go on.
 
 ## 4. Ask once
 

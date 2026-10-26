@@ -44,7 +44,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 ## Install
 
 ```bash
-bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.5
+bb plugin install git:https://github.com/tosergeivc/bb-plugin-jobs.git@semver:^0.5.6
 ```
 
 bb builds the plugin on install. The plugin ships two skills that bb gives to agents in every thread:
@@ -214,6 +214,7 @@ bb plugin install .
 
 ## Changelog
 
+- **0.5.6** — `task-preflight` runs before the first change, even in a short deploy, and its checks find the usual blockers without changing anything: whether `sudo` works, the lowest port a non-root process may bind, write access, missing tools and credentials, whether a port can be shared. A table turns each failed check into a decision with a default (for example port 8080 with `bb connect expose` instead of 80). The `background-jobs` skill sends agents through these checks before the first `bb jobs start` of a deploy or server. Found by a test with real Claude Code and Codex agents: both discovered that port 80 needs root by trying it.
 - **0.5.5** — new skill `task-preflight`: before multi-step work the agent lists what may need the owner, checks what it can, asks once and saves the answers in thread storage. A job that failed because it needed input (sudo, ssh password or host key, git credentials, Python `input()`, a `[y/N]` prompt) gets a `NEEDS INPUT:` line with the reason in `start`, `wait` and `ready`, and its notice is shown in the chat even with agent-only notices.
 - **0.5.4** — `bb jobs prune` run from a thread archives or deletes only that thread's jobs, like `list`; `--all` covers every thread's jobs on the machine. Before, a prune from one thread also archived other threads' finished jobs.
 - **0.5.3** — `--key` holds across processes: claims are a numbered history in which only one process can add each entry, so two processes starting with one key at once start one job (before, a race could start two or three). A claim also records its process's start time, so a reused PID no longer keeps a key busy. A damaged claim gives `key_unknown` and `release-key` frees it. A start interrupted after launching is listed as `incomplete` and can be stopped; a launch that failed before anything ran (`systemd-run` rejected the unit) frees the key at once instead of leaving `key_unknown`. `release-key` refuses while a start with the key is in progress or a job it started exists, unless `--force`, and unlinks the key from every job directory. An error after the launch keeps the key bound, so a retry with the same key returns the job. `/tmp/` and `/tmp` count as one directory; a key from 0.5.0/0.5.1 is compared by command and directory. Start errors are `start_refused` (nothing ran) or `start_unknown` (answer lost, the job may run). `--cpu-quota 0%`, `--memory-max 0` and percentages above 100% are refused. Tests: three processes race on one key.
