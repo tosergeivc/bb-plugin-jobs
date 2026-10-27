@@ -104,5 +104,5 @@ All commands accept `--machine <id|name>` to target another machine and
   `lost` (gone without an exit code: reboot, OOM, killed from outside).
 - Mode `detached` (shown in brackets) survives the end of the turn but, on
   Linux, not a full stop of the bb-app service. Mode `systemd` runs in its own
-  cgroup and is meant to survive both; surviving a bb restart is not yet
-  verified.
+  cgroup: it survived in-app bb updates (observed); a restart of the
+  bb-app service itself is not yet verified.

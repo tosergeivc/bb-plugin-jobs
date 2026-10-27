@@ -30,7 +30,7 @@ When a bb agent starts a long process from its Bash tool (`npm run dev &`, `nohu
 
 | Machine | How a job runs | Survives end of turn | Survives bb service stop/update |
 |---------|----------------|----------------------|---------------------------------|
-| Linux with a user systemd | transient unit `bbjob-<id>` via `systemd-run --user`, its own cgroup | yes | designed to (own cgroup); not yet observed |
+| Linux with a user systemd | transient unit `bbjob-<id>` via `systemd-run --user`, its own cgroup | yes | in-app update: yes, observed; restart of `bb-app.service`: designed to (own cgroup), not yet observed |
 | macOS, or Linux without user systemd | detached session leader | yes | no on Linux; macOS not tested |
 
 ## Requirements
@@ -167,7 +167,8 @@ Tested on 23–24 October 2026 with bb 0.46.2 (nightly), live on two Linux machi
 | `--notify`: one message per ended job; none for a stopped job | passed | passed |
 | Notices batched per thread, withdrawn once the agent read the result, merged into a waiting notice (0.4.0) | passed | not tested |
 | `logs` without escape codes, `--since` cursor (0.4.0) | passed | passed |
-| Survives a full stop/update of the bb service | not yet observed | not tested |
+| Survives an in-app bb update (bb stops its server and starts the new version inside the running service) | passed: a job with a 5-minute heartbeat ran through two updates to 0.47.2-nightly on 26 Oct 2026 without a gap | not tested |
+| Survives a restart of `bb-app.service` (systemd kills the service's cgroup) | not yet observed | not tested |
 
 Real-agent check (0.4.0, 24 October 2026): a Codex thread on the Linux server, given an ordinary task ("start a server that outlives your turn, run a 40-second deploy") without any mention of `bb jobs`, found the `background-jobs` skill, started the server with `--ready-url` and the deploy with `--notify`, and ended its turn. The server kept answering after the turn; the deploy's notice woke the idle thread, which reported exit 0 and its output. The Codex sandbox did not block the `bb` CLI. Another thread's `bb jobs stop` on that server was refused without `--force`.
 
