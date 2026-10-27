@@ -216,6 +216,40 @@ async function boot(options: { service?: boolean } = {}) {
 }
 
 describe("--notify service", () => {
+  it("without --notify, tells the thread only about a job that needed input", async () => {
+    const t = await boot();
+    const needs = await t.start("needs");
+    const fails = await t.start("fails");
+    assert.deepEqual((await t.pending()).sort(), [fails, needs].sort(), "both watched");
+    t.end(fails, 1, "Error: config.yml not found\n");
+    t.end(needs, 1, "sudo: a terminal is required to read the password\n");
+    await until(async () => (await t.pending()).length === 0);
+    await sleep(200);
+    assert.equal(t.sends.length, 1, "one message, for the job that needed input");
+    assert.equal(t.sends[0]!.visibility, undefined, "visible to the owner");
+    assert.match(t.sends[0]!.text, new RegExp(`${needs} exited 1.*\\nNeeds input: sudo`, "s"));
+    assert.doesNotMatch(t.sends[0]!.text, new RegExp(fails));
+  });
+
+  it("still tells the owner about input after the agent read the result", async () => {
+    const t = await boot({ service: false });
+    const job = await t.start("seen", ["--notify"]);
+    t.end(job, 255, "Host key verification failed.\n");
+    const status = await t.harness.behavior.runCli(["status", job], { threadId: THREAD });
+    assert.equal(status.exitCode, 0);
+    assert.deepEqual(await t.pending(), [job], "kept, for the input only");
+    t.runService();
+    await until(() => t.sends.length === 1);
+    assert.match(t.sends[0]!.text, /Needs input: ssh does not know the host key/);
+  });
+
+  it("watches nothing for a job started outside a thread", async () => {
+    const t = await boot({ service: false });
+    const result = await t.harness.behavior.runCli(["start", "--name", "cron", "--cwd", "/tmp", "--", "sleep 60"], {});
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.deepEqual(await t.pending(), []);
+  });
+
   it("shows a notice to the owner when a job failed for lack of input; other notices stay agent-only", async () => {
     const t = await boot();
     const plain = await t.start("plain", ["--notify"]);

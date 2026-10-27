@@ -42,6 +42,12 @@ type NotifyEntry = {
   hostId: string;
   threadId: string;
   addedAt: string;
+  /**
+   * Tell the thread only if the job ends because it needed input (no
+   * --notify, or the agent already saw the result). Such a message is for
+   * the owner: a job cannot be given a password or a confirmation.
+   */
+  inputOnly?: boolean;
   /** Failed send attempts to an idle thread (each one doubles the wait). */
   failures?: number;
   /** Epoch ms before which the entry is not retried. */
@@ -126,12 +132,16 @@ export default async function plugin(bb: BbPluginApi) {
   async function acknowledge(job: Job, threadId: string | undefined): Promise<void> {
     if (!threadId || job.state === "running") return;
     const entries = await readNotify().catch(() => ({}) as Record<string, NotifyEntry>);
-    if (entries[job.id]?.threadId === threadId) {
-      await updateNotify((all) => void delete all[job.id]);
+    if (entries[job.id]?.threadId === threadId && !entries[job.id]!.inputOnly) {
+      // The agent saw the result, but the owner still has to hear about
+      // input the job needed: keep watching for that only.
+      await updateNotify((all) => {
+        if (all[job.id]) all[job.id] = { ...all[job.id]!, inputOnly: true };
+      });
     }
     const sent = await readSent().catch(() => ({}) as Record<string, SentEntry>);
     const mine = sent[job.id];
-    if (mine?.threadId === threadId) {
+    if (mine?.threadId === threadId && !needsInput(mine.section)) {
       await withSentLock(async () => {
         const all = await readSent();
         const entry = all[job.id];
@@ -307,7 +317,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const [id, entry] of Object.entries(entries)) {
       if (signal.aborted) return;
       if (now - Date.parse(entry.addedAt) > NOTIFY_GIVE_UP_MS) {
-        bb.log.warn(`notice for ${id} dropped: not delivered within 72 h`);
+        if (!entry.inputOnly) bb.log.warn(`notice for ${id} dropped: not delivered within 72 h`);
         drops.push(id);
         continue;
       }
@@ -318,8 +328,13 @@ export default async function plugin(bb: BbPluginApi) {
       });
       if (check.kind === "drop") drops.push(id);
       if (check.kind === "report") {
+        const section = noticeSection(check.job, entry.hostId, check.text);
+        if (entry.inputOnly && !needsInput(section)) {
+          drops.push(id); // ended without needing input: nothing to tell
+          continue;
+        }
         const list = byThread.get(entry.threadId) ?? [];
-        list.push({ id, section: noticeSection(check.job, entry.hostId, check.text) });
+        list.push({ id, section });
         byThread.set(entry.threadId, list);
       }
     }
@@ -757,9 +772,17 @@ export default async function plugin(bb: BbPluginApi) {
                   : `The job may be running: check bb jobs list before starting it again, and use --key for starts that must not run twice.`,
               });
             });
-            if (notifyThread) {
+            const watchThread = notifyThread ?? ctx.threadId;
+            if (watchThread && (notifyThread || !job.reused)) {
+              // Without --notify the thread still hears about a job that
+              // ended because it needed input (see NotifyEntry.inputOnly).
               await updateNotify((all) => {
-                all[job.id] = { hostId, threadId: notifyThread, addedAt: new Date().toISOString() };
+                all[job.id] = {
+                  hostId,
+                  threadId: watchThread,
+                  addedAt: new Date().toISOString(),
+                  ...(notifyThread ? {} : { inputOnly: true }),
+                };
               });
             }
             const warnings =

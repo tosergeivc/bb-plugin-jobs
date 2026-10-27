@@ -46,7 +46,8 @@ All commands accept `--machine <id|name>` to target another machine and
 - The job gets no stdin and no terminal. Pass answers with flags or env, never
   prompts: `sudo`, ssh passwords, unknown host keys, git credential prompts and
   `[y/N]` questions fail at once. `NEEDS INPUT:` in `start`/`wait` output names
-  the reason; tell the owner, do not retry the same command. Steps only the owner
+  the reason; the owner also gets a message in the thread (with or without
+  `--notify`). Do not retry the same command; wait for the owner. Steps only the owner
   can do belong in the questions you ask before the work (skill `task-preflight`).
 - For a deploy or any command that must not run twice, pass `--key <stable id>`
   (e.g. `--key deploy:<commit>`): if your first `start` answer was lost, the
